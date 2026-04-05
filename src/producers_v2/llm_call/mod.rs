@@ -97,8 +97,8 @@ impl LlmCallProducer {
 }
 
 /// Build a tool dispatcher from YAML tool definitions.
-pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &crate::tools::dispatcher::S3Config) -> DefaultToolDispatcher {
-    crate::tools::dispatcher::build_tool_dispatcher(tool_defs, s3_config)
+pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &crate::tools::dispatcher::S3Config, llm: Option<std::sync::Arc<dyn crate::llm::LlmClient>>) -> DefaultToolDispatcher {
+    crate::tools::dispatcher::build_tool_dispatcher(tool_defs, s3_config, llm)
 }
 
 impl Produces for LlmCallProducer {

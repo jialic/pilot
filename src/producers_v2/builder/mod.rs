@@ -84,7 +84,7 @@ fn build_producer(step: &Step, ctx: &BuilderContext) -> Result<Arc<dyn Produces>
                 access_key: ctx.s3_access_key.clone(),
                 secret_key: ctx.s3_secret_key.clone(),
             };
-            let dispatcher = crate::tools::dispatcher::build_tool_dispatcher(tools, &s3_config);
+            let dispatcher = crate::tools::dispatcher::build_tool_dispatcher(tools, &s3_config, Some(ctx.llm.clone()));
             Ok(Arc::new(LlmCallProducer::new(
                 ctx.llm.clone(),
                 model.clone(),

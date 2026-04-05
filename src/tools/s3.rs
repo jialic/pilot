@@ -1,15 +1,17 @@
+use std::sync::Arc;
 use serde_json::json;
 
-use crate::llm::ToolDefinition;
+use crate::llm::{LlmClient, ToolDefinition};
 
 use super::{Tool, ToolError};
 
-/// S3-compatible object storage tool with read/write path scoping.
+/// S3-compatible object storage tool with read/write path scoping and semantic search.
 pub struct S3Tool {
     bucket: Box<s3::Bucket>,
     read_patterns: Vec<glob::Pattern>,
     write_patterns: Vec<glob::Pattern>,
     unrestricted: bool,
+    llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl S3Tool {
@@ -20,6 +22,7 @@ impl S3Tool {
         bucket_name: &str,
         read_globs: &[String],
         write_globs: &[String],
+        llm: Option<Arc<dyn LlmClient>>,
     ) -> Result<Self, String> {
         if endpoint.is_empty() || access_key.is_empty() || secret_key.is_empty() {
             return Err("S3 tool requires s3_endpoint, s3_access_key, s3_secret_key in pilot config".into());
@@ -58,6 +61,7 @@ impl S3Tool {
             read_patterns,
             write_patterns,
             unrestricted,
+            llm,
         })
     }
 
@@ -113,7 +117,7 @@ impl Tool for S3Tool {
             "function": {
                 "name": "s3",
                 "description": format!(
-                    "S3 object storage. Bucket: {}.\n\n{scope_desc}\n\nOperations:\n- list: list objects. Optional 'prefix' to filter.\n- read: get object content by key.\n- write: use exactly one of 'overwrite', 'append', or 'edit'. overwrite: write full content (creates if missing). append: add to end (creates if missing). edit: search/replace text in existing object.\n- delete: remove an object.",
+                    "S3 object storage. Bucket: {}.\n\n{scope_desc}\n\nOperations:\n- list: list objects. Optional 'prefix' to filter.\n- read: get object content by key.\n- write: use exactly one of 'overwrite', 'append', or 'edit'. overwrite: write full content (creates if missing). append: add to end (creates if missing). edit: search/replace text in existing object.\n- delete: remove an object.\n- search: semantic search across all readable objects. Returns top matches ranked by relevance.",
                     self.bucket.name,
                 ),
                 "parameters": {
@@ -121,8 +125,8 @@ impl Tool for S3Tool {
                     "properties": {
                         "operation": {
                             "type": "string",
-                            "enum": ["list", "read", "write", "delete"],
-                            "description": "list | read | write | delete"
+                            "enum": ["list", "read", "write", "delete", "search"],
+                            "description": "list | read | write | delete | search"
                         },
                         "key": {
                             "type": "string",
@@ -156,6 +160,10 @@ impl Tool for S3Tool {
                                 "replace": { "type": "string", "description": "Text to replace it with" }
                             },
                             "required": ["search", "replace"]
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "For search: natural language query to find relevant objects"
                         }
                     },
                     "required": ["operation"]
@@ -301,10 +309,104 @@ impl Tool for S3Tool {
 
                     Ok(format!("deleted {key}"))
                 }
+                "search" => {
+                    let query = args["query"].as_str()
+                        .ok_or_else(|| ToolError::ExecutionFailed("search requires 'query'".into()))?;
+
+                    let llm = self.llm.as_ref()
+                        .ok_or_else(|| ToolError::ExecutionFailed("search requires LLM client for embeddings".into()))?;
+
+                    // 1. List all readable objects
+                    let results = self.bucket
+                        .list(String::new(), None)
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("S3 list failed: {e}")))?;
+
+                    let mut keys: Vec<String> = Vec::new();
+                    for result in &results {
+                        for obj in &result.contents {
+                            if self.is_readable(&obj.key) && obj.key.ends_with(".md") {
+                                keys.push(obj.key.clone());
+                            }
+                        }
+                    }
+
+                    if keys.is_empty() {
+                        return Ok("(no searchable objects found)".into());
+                    }
+
+                    // 2. Read all file contents
+                    let mut contents: Vec<String> = Vec::new();
+                    for key in &keys {
+                        let response = self.bucket
+                            .get_object(key)
+                            .await
+                            .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
+                        let body = String::from_utf8_lossy(response.bytes()).to_string();
+                        // Truncate large files for embedding
+                        let truncated = if body.len() > 8000 {
+                            // Find a char boundary near 8000
+                            let mut end = 8000;
+                            while !body.is_char_boundary(end) { end -= 1; }
+                            body[..end].to_string()
+                        } else { body };
+                        contents.push(truncated);
+                    }
+
+                    // 3. Embed all files + query
+                    let mut all_texts = contents.clone();
+                    all_texts.push(query.to_string());
+
+                    let embeddings = llm.embed(&all_texts)
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+
+                    if embeddings.is_empty() {
+                        return Ok("(no embeddings returned)".into());
+                    }
+
+                    let dims = embeddings[0].len();
+                    let query_embedding = embeddings.last()
+                        .ok_or_else(|| ToolError::ExecutionFailed("no query embedding".into()))?;
+
+                    // 4. Build usearch index in memory
+                    use usearch::Index;
+                    let index = Index::new(&usearch::IndexOptions {
+                        dimensions: dims,
+                        metric: usearch::MetricKind::Cos,
+                        quantization: usearch::ScalarKind::F32,
+                        ..Default::default()
+                    }).map_err(|e| ToolError::ExecutionFailed(format!("index create: {e}")))?;
+
+                    index.reserve(keys.len())
+                        .map_err(|e| ToolError::ExecutionFailed(format!("index reserve: {e}")))?;
+
+                    for (i, emb) in embeddings[..keys.len()].iter().enumerate() {
+                        index.add(i as u64, emb)
+                            .map_err(|e| ToolError::ExecutionFailed(format!("index add: {e}")))?;
+                    }
+
+                    // 5. Search
+                    let results = index.search(query_embedding, 10)
+                        .map_err(|e| ToolError::ExecutionFailed(format!("index search: {e}")))?;
+
+                    let output: Vec<String> = results.keys.iter()
+                        .zip(results.distances.iter())
+                        .map(|(key, distance)| {
+                            let i = *key as usize;
+                            let k = &keys[i];
+                            let similarity = 1.0 - distance;
+                            format!("--- {k} (score: {similarity:.3}) ---\n{}\n", contents[i])
+                        })
+                        .collect();
+
+                    Ok(output.join("\n"))
+                }
                 other => {
-                    Ok(format!("unknown operation: {other}. Supported: list, read, write, delete"))
+                    Ok(format!("unknown operation: {other}. Supported: list, read, write, delete, search"))
                 }
             }
         })
     }
 }
+

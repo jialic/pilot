@@ -101,6 +101,51 @@ impl OpenAIClient {
         body
     }
 
+    pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
+        let body = serde_json::json!({
+            "model": "text-embedding-3-small",
+            "input": texts,
+        });
+
+        let response = self.client
+            .post("https://api.openai.com/v1/embeddings")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+        let status = response.status();
+        let text = response.text().await
+            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+        if !status.is_success() {
+            return Err(LlmError::RequestFailed(format!("embedding HTTP {status}: {text}")));
+        }
+
+        let resp: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| LlmError::ParseError(format!("embedding parse: {e}")))?;
+
+        let embeddings = resp["data"]
+            .as_array()
+            .ok_or_else(|| LlmError::ParseError("no data in embedding response".into()))?
+            .iter()
+            .map(|item| {
+                item["embedding"]
+                    .as_array()
+                    .ok_or_else(|| LlmError::ParseError("no embedding vector".into()))
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
+            })
+            .collect::<Result<Vec<Vec<f32>>, _>>()?;
+
+        Ok(embeddings)
+    }
+
     pub async fn call(
         &self,
         messages: &[ChatMessage],

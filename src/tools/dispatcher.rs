@@ -69,7 +69,7 @@ pub struct S3Config {
 }
 
 /// Build a tool dispatcher from YAML tool definitions.
-pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &S3Config) -> DefaultToolDispatcher {
+pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &S3Config, llm: Option<Arc<dyn crate::llm::LlmClient>>) -> DefaultToolDispatcher {
     let tools: Vec<Arc<dyn super::Tool>> = tool_defs
         .iter()
         .map(|def| -> Arc<dyn super::Tool> {
@@ -96,6 +96,7 @@ pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &S3Config) -> Def
                         &config.bucket,
                         &config.read,
                         &config.write,
+                        llm.clone(),
                     )
                     .expect("S3 tool config error")
                 ),

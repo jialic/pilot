@@ -40,6 +40,14 @@ fn construct_tool(
     tool_def: &ExposedToolDef,
     cfg: &Config,
 ) -> Result<Box<dyn crate::tools::Tool>, String> {
+    // Build LLM client for embedding support
+    let llm: Option<std::sync::Arc<dyn crate::llm::LlmClient>> = if !cfg.openai_api_key.is_empty() {
+        let llm_config = cfg.to_llm_config();
+        Some(std::sync::Arc::new(crate::llm::LLM::new(llm_config)))
+    } else {
+        None
+    };
+
     match tool_def {
         ExposedToolDef::S3 { config } => {
             Ok(Box::new(crate::tools::s3::S3Tool::new(
@@ -49,6 +57,7 @@ fn construct_tool(
                 &config.bucket,
                 &config.read,
                 &config.write,
+                llm,
             )
             .map_err(|e| format!("S3 tool error: {e}"))?))
         }

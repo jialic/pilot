@@ -108,6 +108,11 @@ pub trait LlmClient: Send + Sync {
         tools: Vec<ToolDefinition>,
         model_override: Option<&'a str>,
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>>;
+
+    fn embed<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send + 'a>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +333,15 @@ impl LlmClient for LLM {
     ) -> Pin<Box<dyn Future<Output = Result<ChatResponse, LlmError>> + Send + 'a>> {
         Box::pin(async move {
             self.chat(messages, Some(tools), Some("required"), model_override).await
+        })
+    }
+
+    fn embed<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.openai.embed(texts).await
         })
     }
 }

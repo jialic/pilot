@@ -48,6 +48,16 @@ impl LlmClient for MockLlm {
             self.chat(messages, Some(tools), Some("required"), model_override).await
         })
     }
+
+    fn embed<'a>(
+        &'a self,
+        texts: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Vec<f32>>, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Return zero vectors for testing
+            Ok(texts.iter().map(|_| vec![0.0; 256]).collect())
+        })
+    }
 }
 
 #[cfg(test)]
