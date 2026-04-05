@@ -577,6 +577,10 @@ async fn main() {
                 println!("openai_api_key:    {}", mask_token(&cfg.openai_api_key));
                 println!("anthropic_api_key: {}", mask_token(&cfg.anthropic_api_key));
                 println!("gemini_api_key:    {}", mask_token(&cfg.gemini_api_key));
+                println!("xai_api_key:       {}", mask_token(&cfg.xai_api_key));
+                println!("s3_endpoint:       {}", if cfg.s3_endpoint.is_empty() { "(not set)" } else { &cfg.s3_endpoint });
+                println!("s3_access_key:     {}", mask_token(&cfg.s3_access_key));
+                println!("s3_secret_key:     {}", mask_token(&cfg.s3_secret_key));
             }
         },
     }
