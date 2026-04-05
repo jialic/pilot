@@ -1,0 +1,20 @@
+steps:
+  # Two branches run concurrently, merged via SQL
+  - action: parallel
+    merge_sql: |
+      SELECT * FROM (
+        SELECT * FROM a
+        UNION ALL
+        SELECT * FROM b
+      )
+    branches:
+      - name: a
+        body:
+          - action: shell
+            command: "echo branch_a_result"
+            post_output_sql: "SELECT 'a' AS name, TRIM(output) AS output FROM input"
+      - name: b
+        body:
+          - action: shell
+            command: "echo branch_b_result"
+            post_output_sql: "SELECT 'b' AS name, TRIM(output) AS output FROM input"

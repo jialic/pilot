@@ -1,0 +1,57 @@
+model: openai/gpt-5-mini
+steps:
+  - action: loop
+    pre_input_sql: "SELECT CAST(0 AS BIGINT) AS ts, '' AS role, '' AS content FROM input WHERE false"
+    body:
+      # Add user message to history
+      - action: parallel
+        merge_sql: |
+          SELECT * FROM (
+            SELECT * FROM input
+            UNION ALL
+            SELECT CAST(extract(epoch FROM now()) * 1000 AS BIGINT) AS ts,
+                   'user' AS role,
+                   result.output AS content
+            FROM result
+          ) ORDER BY ts
+        branches:
+          - name: input
+            body:
+              - action: passthrough
+          - name: result
+            body:
+              - action: read_input
+      # Compact before LLM — smallest possible context window
+      - action: compact
+        max_words: 200000
+        compact_ratio: 0.5
+        prompt: Summarize the conversation concisely. Preserve key facts, decisions, and context needed to continue naturally.
+      # Run LLM, print response, add all rows to history
+      - action: parallel
+        merge_sql: |
+          SELECT * FROM (
+            SELECT * FROM input
+            UNION ALL
+            SELECT * FROM result
+          ) ORDER BY ts
+        branches:
+          - name: input
+            body:
+              - action: passthrough
+          - name: result
+            body:
+              - action: llm
+                prompt: You are a helpful assistant. Have a conversation with the user.
+      # Print last assistant response (parallel preserves history, print is a side effect)
+      - action: parallel
+        merge_sql: "SELECT * FROM input"
+        branches:
+          - name: input
+            body:
+              - action: passthrough
+          - name: result
+            body:
+              - action: transform
+                sql: "SELECT content AS output FROM input WHERE role = 'assistant' ORDER BY ts DESC LIMIT 1"
+              - action: print
+    while_sql: "SELECT 'true' AS __continue"

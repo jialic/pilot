@@ -1,0 +1,9 @@
+steps:
+  - action: trigger
+    command: "printf '{\"ts\":\"1\"}\\n{\"ts\":\"2\"}\\n{\"ts\":\"3\"}\\n'"
+    output_schema:
+      - name: ts
+        type: string
+    body:
+      - action: transform
+        sql: "SELECT ts AS name, 'tick at ' || ts AS output FROM input"

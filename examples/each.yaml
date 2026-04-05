@@ -1,0 +1,11 @@
+steps:
+  # Default output_schema: body must produce |name, output|
+  - action: transform
+    sql: |
+      SELECT * FROM (
+        VALUES ('1', 'paris'), ('2', 'tokyo'), ('3', 'nyc')
+      ) AS t(id, city)
+  - action: each
+    body:
+      - action: transform
+        sql: "SELECT city AS name, 'visited ' || city AS output FROM input"

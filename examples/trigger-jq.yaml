@@ -1,0 +1,13 @@
+steps:
+  # Trigger with jq transform + multi-field output_schema
+  - action: trigger
+    command: "printf '{\"data\":{\"id\":1,\"msg\":\"hello\"}}\\n{\"data\":{\"id\":2,\"msg\":\"world\"}}\\n'"
+    jq: ".data"
+    output_schema:
+      - name: id
+        type: integer
+      - name: msg
+        type: string
+    body:
+      - action: transform
+        sql: "SELECT 'event' AS name, CAST(id AS VARCHAR) || ': ' || msg AS output FROM input"

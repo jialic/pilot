@@ -1,0 +1,11 @@
+steps:
+  - action: read_var
+    vars:
+      - name: greeting
+        arg: greeting
+        default: hello
+      - name: target
+        arg: target
+        default: world
+  - action: shell
+    command: "echo '{{ greeting }} {{ target }}!'"

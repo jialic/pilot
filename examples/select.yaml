@@ -1,0 +1,22 @@
+steps:
+  # match: first — run first matching branch
+  - action: transform
+    sql: "SELECT 'high' AS priority"
+  - action: select
+    mode: first
+    branches:
+      - name: low
+        when: "SELECT CASE WHEN priority = 'low' THEN 'true' ELSE 'false' END AS output FROM input"
+        body:
+          - action: transform
+            sql: "SELECT 'low' AS name, 'handling low priority' AS output"
+      - name: high
+        when: "SELECT CASE WHEN priority = 'high' THEN 'true' ELSE 'false' END AS output FROM input"
+        body:
+          - action: transform
+            sql: "SELECT 'high' AS name, 'handling high priority' AS output"
+      - name: default
+        when: "SELECT 'true' AS output"
+        body:
+          - action: transform
+            sql: "SELECT 'default' AS name, 'fallback' AS output"

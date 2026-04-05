@@ -1,0 +1,27 @@
+steps:
+  - action: read_input
+    prompt: What code review topic or code snippet would you like reviewed?
+  - action: transform
+    sql: "SELECT CAST(extract(epoch FROM now()) * 1000 AS BIGINT) AS ts, 'user' AS role, output AS content FROM input"
+  - action: parallel
+    post_output_sql: |
+      SELECT
+        MAX(CASE WHEN name = 'GPT' THEN output END) || E'\n\n' ||
+        MAX(CASE WHEN name = 'Claude' THEN output END) AS output
+      FROM input
+    branches:
+      - action: llm
+        model: openai/gpt-5-mini
+        prompt: "You are a battle-hardened security engineer. Your job is to find vulnerabilities, attack surfaces, and unsafe patterns in the code. Focus exclusively on: input validation, authentication/authorization flaws, injection risks, sensitive data exposure, error handling that leaks info, and dependency risks. Do not comment on style or general code quality — only security."
+        post_output_sql: "SELECT 'GPT' AS name, content AS output FROM input WHERE role = 'assistant' ORDER BY ts DESC LIMIT 1"
+      - action: llm
+        model: anthropic/claude-haiku-4-5
+        prompt: "You are a senior software architect with a passion for clean, maintainable systems. Your job is to evaluate the long-term health of the code. Focus exclusively on: architecture and design patterns, separation of concerns, naming and readability, testability, scalability, and tech debt. Do not comment on security vulnerabilities — only structure and maintainability."
+        post_output_sql: "SELECT 'Claude' AS name, content AS output FROM input WHERE role = 'assistant' ORDER BY ts DESC LIMIT 1"
+  - action: transform
+    sql: "SELECT CAST(extract(epoch FROM now()) * 1000 AS BIGINT) AS ts, 'user' AS role, output AS content FROM input"
+  - action: llm
+    name: Synthesis
+    prompt: "You are a lead engineer synthesizing two independent code reviews into one unified, prioritized report. You have received a security review and an architecture/maintainability review. Your job is to: 1) Merge all findings, removing duplicates. 2) Prioritize issues by overall impact (Critical, High, Medium, Low). 3) For each issue, include: the category (Security / Architecture / Both), a clear description, and a recommended fix. Present the final output as a clean, structured report that a developer can act on immediately."
+    post_output_sql: "SELECT content AS output FROM input WHERE role = 'assistant' ORDER BY ts DESC LIMIT 1"
+  - action: print

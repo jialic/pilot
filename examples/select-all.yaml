@@ -1,0 +1,22 @@
+steps:
+  # match: all — run all matching branches
+  - action: transform
+    sql: "SELECT 5 AS score"
+  - action: select
+    mode: all
+    branches:
+      - name: positive
+        when: "SELECT CASE WHEN score > 0 THEN 'true' ELSE 'false' END AS output FROM input"
+        body:
+          - action: transform
+            sql: "SELECT 'positive' AS name, 'score is positive' AS output"
+      - name: small
+        when: "SELECT CASE WHEN score < 10 THEN 'true' ELSE 'false' END AS output FROM input"
+        body:
+          - action: transform
+            sql: "SELECT 'small' AS name, 'score is small' AS output"
+      - name: negative
+        when: "SELECT CASE WHEN score < 0 THEN 'true' ELSE 'false' END AS output FROM input"
+        body:
+          - action: transform
+            sql: "SELECT 'negative' AS name, 'score is negative' AS output"
