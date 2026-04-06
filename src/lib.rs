@@ -11,6 +11,7 @@ pub mod runner;
 pub mod screen_capture;
 pub mod sql;
 pub mod args;
+pub mod chunker;
 pub mod tool_cli;
 pub mod tools;
 pub mod update;

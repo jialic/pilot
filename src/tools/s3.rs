@@ -335,26 +335,33 @@ impl Tool for S3Tool {
                         return Ok("(no searchable objects found)".into());
                     }
 
-                    // 2. Read all file contents
-                    let mut contents: Vec<String> = Vec::new();
-                    for key in &keys {
+                    // 2. Read all files and chunk them
+                    use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
+
+                    struct ChunkMeta {
+                        key_idx: usize,
+                        text: String,
+                    }
+
+                    let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
+                    for (key_idx, key) in keys.iter().enumerate() {
                         let response = self.bucket
                             .get_object(key)
                             .await
                             .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
                         let body = String::from_utf8_lossy(response.bytes()).to_string();
-                        // Truncate large files for embedding
-                        let truncated = if body.len() > 8000 {
-                            // Find a char boundary near 8000
-                            let mut end = 8000;
-                            while !body.is_char_boundary(end) { end -= 1; }
-                            body[..end].to_string()
-                        } else { body };
-                        contents.push(truncated);
+                        let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
+                        for chunk in chunks {
+                            chunk_metas.push(ChunkMeta { key_idx, text: chunk.text });
+                        }
                     }
 
-                    // 3. Embed all files + query
-                    let mut all_texts = contents.clone();
+                    if chunk_metas.is_empty() {
+                        return Ok("(no searchable content found)".into());
+                    }
+
+                    // 3. Embed all chunks + query
+                    let mut all_texts: Vec<String> = chunk_metas.iter().map(|c| c.text.clone()).collect();
                     all_texts.push(query.to_string());
 
                     let embeddings = llm.embed(&all_texts)
@@ -378,10 +385,10 @@ impl Tool for S3Tool {
                         ..Default::default()
                     }).map_err(|e| ToolError::ExecutionFailed(format!("index create: {e}")))?;
 
-                    index.reserve(keys.len())
+                    index.reserve(chunk_metas.len())
                         .map_err(|e| ToolError::ExecutionFailed(format!("index reserve: {e}")))?;
 
-                    for (i, emb) in embeddings[..keys.len()].iter().enumerate() {
+                    for (i, emb) in embeddings[..chunk_metas.len()].iter().enumerate() {
                         index.add(i as u64, emb)
                             .map_err(|e| ToolError::ExecutionFailed(format!("index add: {e}")))?;
                     }
@@ -390,17 +397,23 @@ impl Tool for S3Tool {
                     let results = index.search(query_embedding, 10)
                         .map_err(|e| ToolError::ExecutionFailed(format!("index search: {e}")))?;
 
-                    let output: Vec<String> = results.keys.iter()
+                    let output: Vec<serde_json::Value> = results.keys.iter()
                         .zip(results.distances.iter())
                         .map(|(key, distance)| {
                             let i = *key as usize;
-                            let k = &keys[i];
+                            let meta = &chunk_metas[i];
+                            let k = &keys[meta.key_idx];
                             let similarity = 1.0 - distance;
-                            format!("--- {k} (cosine similarity: {similarity:.3}) ---\n{}\n", contents[i])
+                            serde_json::json!({
+                                "path": k,
+                                "cosine_similarity": (similarity * 1000.0).round() / 1000.0,
+                                "chunk": meta.text,
+                            })
                         })
                         .collect();
 
-                    Ok(output.join("\n"))
+                    Ok(serde_json::to_string_pretty(&output)
+                        .unwrap_or_else(|_| "[]".into()))
                 }
                 other => {
                     Ok(format!("unknown operation: {other}. Supported: list, read, write, delete, search"))
