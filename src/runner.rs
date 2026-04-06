@@ -20,6 +20,7 @@ impl Runner {
         io: Arc<dyn crate::user_io::UserIO>,
         events: Arc<dyn RunnerEvents>,
         args: HashMap<String, Vec<String>>,
+        yaml_path: &str,
     ) -> Self {
         let mut llm_config = llm_config;
         llm_config.model = workflow.model.clone()
@@ -30,6 +31,7 @@ impl Runner {
             s3_endpoint: cfg.s3_endpoint.clone(),
             s3_access_key: cfg.s3_access_key.clone(),
             s3_secret_key: cfg.s3_secret_key.clone(),
+            yaml_path: yaml_path.to_string(),
             listener: Arc::new(StderrListener),
         };
         Self { workflow, events, ctx }

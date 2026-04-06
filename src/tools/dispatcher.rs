@@ -66,6 +66,7 @@ pub struct S3Config {
     pub endpoint: String,
     pub access_key: String,
     pub secret_key: String,
+    pub yaml_path: String,
 }
 
 /// Build a tool dispatcher from YAML tool definitions.
@@ -97,6 +98,7 @@ pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &S3Config, llm: O
                         &config.read,
                         &config.write,
                         llm.clone(),
+                        &s3_config.yaml_path,
                     )
                     .expect("S3 tool config error")
                 ),

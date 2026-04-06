@@ -364,7 +364,8 @@ async fn main() {
             let llm_config = cfg.to_llm_config();
             let io: Arc<dyn UserIO> = Arc::new(StdinIO);
             let events: Arc<dyn RunnerEvents> = Arc::new(TracingEvents);
-            let runner = Runner::new(llm_config, &cfg, wf, io, events, workflow_args);
+            let yaml_path = workflow_path.canonicalize().unwrap_or(workflow_path.clone());
+            let runner = Runner::new(llm_config, &cfg, wf, io, events, workflow_args, &yaml_path.to_string_lossy());
 
             match runner.run().await {
                 Ok(output_bytes) => {

@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use serde_json::json;
 
@@ -8,7 +10,7 @@ use super::{Tool, ToolError};
 /// S3-compatible object storage tool with read/write path scoping and semantic search.
 pub struct S3Tool {
     bucket: Box<s3::Bucket>,
-    bucket_name: String,
+    cache_key: String,
     read_patterns: Vec<glob::Pattern>,
     write_patterns: Vec<glob::Pattern>,
     llm: Option<Arc<dyn LlmClient>>,
@@ -23,6 +25,7 @@ impl S3Tool {
         read_globs: &[String],
         write_globs: &[String],
         llm: Option<Arc<dyn LlmClient>>,
+        yaml_path: &str,
     ) -> Result<Self, String> {
         if endpoint.is_empty() || access_key.is_empty() || secret_key.is_empty() {
             return Err("S3 tool requires s3_endpoint, s3_access_key, s3_secret_key in pilot config".into());
@@ -54,9 +57,13 @@ impl S3Tool {
             .map(|g| glob::Pattern::new(g).map_err(|e| format!("invalid write glob '{g}': {e}")))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut hasher = DefaultHasher::new();
+        yaml_path.hash(&mut hasher);
+        let cache_key = format!("{}-{:x}", bucket_name, hasher.finish());
+
         Ok(Self {
             bucket,
-            bucket_name: bucket_name.to_string(),
+            cache_key,
             read_patterns,
             write_patterns,
             llm,
@@ -344,10 +351,6 @@ impl Tool for S3Tool {
                         }
                     }
 
-                    if s3_entries.is_empty() {
-                        return Ok("(no searchable objects found)".into());
-                    }
-
                     // 2. Open or create file-based libSQL db
                     let home = std::env::var_os("HOME")
                         .ok_or_else(|| ToolError::ExecutionFailed("HOME not set".into()))?;
@@ -357,7 +360,7 @@ impl Tool for S3Tool {
                         .join("s3");
                     std::fs::create_dir_all(&cache_dir)
                         .map_err(|e| ToolError::ExecutionFailed(format!("cache dir: {e}")))?;
-                    let db_path = cache_dir.join(format!("{}.db", self.bucket_name));
+                    let db_path = cache_dir.join(format!("{}.db", self.cache_key));
 
                     let db = libsql::Builder::new_local(&db_path)
                         .build().await
@@ -370,16 +373,7 @@ impl Tool for S3Tool {
                         .await
                         .map_err(|e| ToolError::ExecutionFailed(e))?;
 
-                    // Embed the query
-                    let query_embeddings = llm.embed(&[query.to_string()])
-                        .await
-                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
-                    if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
-                        return Ok("(no embeddings returned)".into());
-                    }
-                    let query_embedding = &query_embeddings[0];
-
-                    // 4. Diff: compare S3 ETags against cached files
+                    // 3. Diff: compare S3 ETags against cached files
                     let mut cached: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                     let mut rows = conn.query("SELECT s3_key, etag FROM files", ())
                         .await.map_err(|e| ToolError::ExecutionFailed(format!("db files read: {e}")))?;
@@ -409,6 +403,19 @@ impl Tool for S3Tool {
                         conn.execute("DELETE FROM files WHERE s3_key = ?1", libsql::params![key.clone()])
                             .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete file: {e}")))?;
                     }
+
+                    if s3_entries.is_empty() {
+                        return Ok("(no searchable objects found)".into());
+                    }
+
+                    // Embed the query
+                    let query_embeddings = llm.embed(&[query.to_string()])
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+                    if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
+                        return Ok("(no embeddings returned)".into());
+                    }
+                    let query_embedding = &query_embeddings[0];
 
                     // Identify new keys (not in cache, or were stale and just deleted)
                     let new_entries: Vec<&S3Entry> = s3_entries.iter()

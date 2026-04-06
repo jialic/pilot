@@ -32,6 +32,7 @@ pub struct BuilderContext {
     pub s3_endpoint: String,
     pub s3_access_key: String,
     pub s3_secret_key: String,
+    pub yaml_path: String,
     pub listener: Arc<dyn Listener>,
 }
 
@@ -83,6 +84,7 @@ fn build_producer(step: &Step, ctx: &BuilderContext) -> Result<Arc<dyn Produces>
                 endpoint: ctx.s3_endpoint.clone(),
                 access_key: ctx.s3_access_key.clone(),
                 secret_key: ctx.s3_secret_key.clone(),
+                yaml_path: ctx.yaml_path.clone(),
             };
             let dispatcher = crate::tools::dispatcher::build_tool_dispatcher(tools, &s3_config, Some(ctx.llm.clone()));
             Ok(Arc::new(LlmCallProducer::new(

@@ -39,6 +39,7 @@ fn load_tool_def(path: &PathBuf) -> Result<ExposedToolDef, String> {
 fn construct_tool(
     tool_def: &ExposedToolDef,
     cfg: &Config,
+    yaml_path: &str,
 ) -> Result<Box<dyn crate::tools::Tool>, String> {
     // Build LLM client for embedding support
     let llm: Option<std::sync::Arc<dyn crate::llm::LlmClient>> = if !cfg.openai_api_key.is_empty() {
@@ -58,6 +59,7 @@ fn construct_tool(
                 &config.read,
                 &config.write,
                 llm,
+                yaml_path,
             )
             .map_err(|e| format!("S3 tool error: {e}"))?))
         }
@@ -124,7 +126,8 @@ pub async fn run_tool(
 ) -> Result<String, String> {
     let path = find_tool_yaml(name)?;
     let tool_def = load_tool_def(&path)?;
-    let tool = construct_tool(&tool_def, cfg)?;
+    let yaml_path = path.canonicalize().unwrap_or(path.clone());
+    let tool = construct_tool(&tool_def, cfg, &yaml_path.to_string_lossy())?;
 
     // No args — show help
     if args.is_empty() {

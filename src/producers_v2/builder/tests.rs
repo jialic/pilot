@@ -22,6 +22,7 @@ fn test_ctx() -> BuilderContext {
         s3_endpoint: String::new(),
         s3_access_key: String::new(),
         s3_secret_key: String::new(),
+        yaml_path: String::new(),
         listener: Arc::new(crate::events::NoopListener),
     }
 }
