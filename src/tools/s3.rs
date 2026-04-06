@@ -396,7 +396,7 @@ impl Tool for S3Tool {
                             let i = *key as usize;
                             let k = &keys[i];
                             let similarity = 1.0 - distance;
-                            format!("--- {k} (score: {similarity:.3}) ---\n{}\n", contents[i])
+                            format!("--- {k} (cosine similarity: {similarity:.3}) ---\n{}\n", contents[i])
                         })
                         .collect();
 
