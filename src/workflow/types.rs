@@ -79,8 +79,20 @@ impl ToolName {
             ],
             ToolName::S3 => vec![
                 ("bucket", "Required. S3 bucket name."),
-                ("read", "List of glob patterns for readable keys. Empty = unrestricted."),
-                ("write", "List of glob patterns for writable keys. Empty = unrestricted. Write implies read."),
+                ("read", "List of glob patterns for readable keys. Empty = no read access."),
+                ("write", "List of glob patterns for writable keys. Empty = no write access. Write implies read."),
+            ],
+            _ => vec![],
+        }
+    }
+
+    /// Config keys (set via `pilot config set`) required at runtime.
+    pub fn required_config(&self) -> Vec<(&str, &str)> {
+        match self {
+            ToolName::S3 => vec![
+                ("s3_endpoint", "S3-compatible endpoint URL"),
+                ("s3_access_key", "Access key ID"),
+                ("s3_secret_key", "Secret access key"),
             ],
             _ => vec![],
         }

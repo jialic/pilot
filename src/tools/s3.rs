@@ -11,7 +11,6 @@ pub struct S3Tool {
     bucket_name: String,
     read_patterns: Vec<glob::Pattern>,
     write_patterns: Vec<glob::Pattern>,
-    unrestricted: bool,
     llm: Option<Arc<dyn LlmClient>>,
 }
 
@@ -55,26 +54,21 @@ impl S3Tool {
             .map(|g| glob::Pattern::new(g).map_err(|e| format!("invalid write glob '{g}': {e}")))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let unrestricted = read_patterns.is_empty() && write_patterns.is_empty();
-
         Ok(Self {
             bucket,
             bucket_name: bucket_name.to_string(),
             read_patterns,
             write_patterns,
-            unrestricted,
             llm,
         })
     }
 
     fn is_readable(&self, key: &str) -> bool {
-        if self.unrestricted { return true; }
         self.read_patterns.iter().any(|p| p.matches(key))
             || self.write_patterns.iter().any(|p| p.matches(key))
     }
 
     fn is_writable(&self, key: &str) -> bool {
-        if self.unrestricted { return true; }
         self.write_patterns.iter().any(|p| p.matches(key))
     }
 
@@ -109,9 +103,7 @@ impl Tool for S3Tool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let scope_desc = if self.unrestricted {
-            "Access: unrestricted.".to_string()
-        } else {
+        let scope_desc = {
             let read_globs: Vec<&str> = self.read_patterns.iter().map(|p| p.as_str()).collect();
             let write_globs: Vec<&str> = self.write_patterns.iter().map(|p| p.as_str()).collect();
             format!(

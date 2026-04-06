@@ -99,6 +99,22 @@ WORKFLOW DISCOVERY:
   Workflows are YAML files in .pilot/ directories. Pilot searches the
   current directory and parents. Run 'pilot ls' to list available workflows.
 
+EXPOSED TOOLS:
+  Tools can be exposed as standalone CLI commands via .pilot/tools/<name>.yaml.
+  Each file defines a single tool with scoped permissions:
+
+    # .pilot/tools/todos.yaml
+    name: s3
+    bucket: mine
+    read: [\"*\"]
+    write: [\"projects/pilot/*\"]
+
+  Invoke with: pilot tool <name> --key value
+  Supports dot notation for nesting: --edit.search \"old\" --edit.replace \"new\"
+  Run 'pilot tool <name>' with no args to see parameters.
+  Run 'pilot help tools' for tool types and required config.
+  Discovery: searches .pilot/tools/ in current directory and parents.
+
 EXAMPLE USE CASES:
   - Code review: parallel LLM analysis (security + architecture), synthesize
   - Data extraction: fetch APIs, LLM extracts structured data from responses
@@ -144,6 +160,14 @@ pub fn print_tools() {
             println!("  {}", "Config:".dimmed());
             for (name, desc) in &attrs {
                 println!("    {}: {}", name.bold(), desc);
+            }
+        }
+        let req = tool.required_config();
+        if !req.is_empty() {
+            println!();
+            println!("  {}", "Required config (pilot config set):".dimmed());
+            for (key, desc) in &req {
+                println!("    {}: {}", key.bold(), desc);
             }
         }
         println!();
