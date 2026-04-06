@@ -8,6 +8,7 @@ use super::{Tool, ToolError};
 /// S3-compatible object storage tool with read/write path scoping and semantic search.
 pub struct S3Tool {
     bucket: Box<s3::Bucket>,
+    bucket_name: String,
     read_patterns: Vec<glob::Pattern>,
     write_patterns: Vec<glob::Pattern>,
     unrestricted: bool,
@@ -58,6 +59,7 @@ impl S3Tool {
 
         Ok(Self {
             bucket,
+            bucket_name: bucket_name.to_string(),
             read_patterns,
             write_patterns,
             unrestricted,
@@ -88,6 +90,13 @@ impl S3Tool {
         let globs: Vec<&str> = self.write_patterns.iter().map(|p| p.as_str()).collect();
         if globs.is_empty() { "none".into() } else { globs.join(", ") }
     }
+}
+
+fn is_text_file(key: &str) -> bool {
+    matches!(
+        key.rsplit('.').next(),
+        Some("md" | "txt" | "yaml" | "yml" | "json" | "toml" | "csv" | "xml" | "html" | "rst" | "org" | "log")
+    )
 }
 
 impl Tool for S3Tool {
@@ -316,109 +325,211 @@ impl Tool for S3Tool {
                     let llm = self.llm.as_ref()
                         .ok_or_else(|| ToolError::ExecutionFailed("search requires LLM client for embeddings".into()))?;
 
-                    // 1. List all readable objects
+                    // 1. List all readable objects with ETags
                     let results = self.bucket
                         .list(String::new(), None)
                         .await
                         .map_err(|e| ToolError::ExecutionFailed(format!("S3 list failed: {e}")))?;
 
-                    let mut keys: Vec<String> = Vec::new();
+                    struct S3Entry {
+                        key: String,
+                        etag: String,
+                    }
+
+                    let mut s3_entries: Vec<S3Entry> = Vec::new();
                     for result in &results {
                         for obj in &result.contents {
-                            if self.is_readable(&obj.key) && obj.key.ends_with(".md") {
-                                keys.push(obj.key.clone());
+                            if self.is_readable(&obj.key) && is_text_file(&obj.key) {
+                                s3_entries.push(S3Entry {
+                                    key: obj.key.clone(),
+                                    etag: obj.e_tag.clone().unwrap_or_default(),
+                                });
                             }
                         }
                     }
 
-                    if keys.is_empty() {
+                    if s3_entries.is_empty() {
                         return Ok("(no searchable objects found)".into());
                     }
 
-                    // 2. Read all files and chunk them
-                    use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
+                    // 2. Open or create file-based libSQL db
+                    let home = std::env::var_os("HOME")
+                        .ok_or_else(|| ToolError::ExecutionFailed("HOME not set".into()))?;
+                    let cache_dir = std::path::PathBuf::from(home)
+                        .join(".pilot")
+                        .join("cache")
+                        .join("s3");
+                    std::fs::create_dir_all(&cache_dir)
+                        .map_err(|e| ToolError::ExecutionFailed(format!("cache dir: {e}")))?;
+                    let db_path = cache_dir.join(format!("{}.db", self.bucket_name));
 
-                    struct ChunkMeta {
-                        key_idx: usize,
-                        text: String,
-                    }
-
-                    let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
-                    for (key_idx, key) in keys.iter().enumerate() {
-                        let response = self.bucket
-                            .get_object(key)
-                            .await
-                            .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
-                        let body = String::from_utf8_lossy(response.bytes()).to_string();
-                        let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
-                        for chunk in chunks {
-                            chunk_metas.push(ChunkMeta { key_idx, text: chunk.text });
-                        }
-                    }
-
-                    if chunk_metas.is_empty() {
-                        return Ok("(no searchable content found)".into());
-                    }
-
-                    // 3. Embed all chunks + query
-                    let mut all_texts: Vec<String> = chunk_metas.iter().map(|c| c.text.clone()).collect();
-                    all_texts.push(query.to_string());
-
-                    let embeddings = llm.embed(&all_texts)
-                        .await
-                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
-
-                    if embeddings.is_empty() {
-                        return Ok("(no embeddings returned)".into());
-                    }
-
-                    let dims = embeddings[0].len();
-                    if dims == 0 || dims > 10000 {
-                        return Err(ToolError::ExecutionFailed(format!("unexpected embedding dimensions: {dims}")));
-                    }
-                    let query_embedding = embeddings.last()
-                        .ok_or_else(|| ToolError::ExecutionFailed("no query embedding".into()))?;
-
-                    // 4. Build libSQL in-memory db with vectors
-                    let db = libsql::Builder::new_local(":memory:")
+                    let db = libsql::Builder::new_local(&db_path)
                         .build().await
-                        .map_err(|e| ToolError::ExecutionFailed(format!("db create: {e}")))?;
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db open: {e}")))?;
                     let conn = db.connect()
                         .map_err(|e| ToolError::ExecutionFailed(format!("db connect: {e}")))?;
 
+                    // 3. Ensure schema exists + check embedding dimension
                     conn.execute(
-                        &format!("CREATE TABLE chunks (id INTEGER PRIMARY KEY, key_idx INTEGER, chunk_text TEXT, embedding F32_BLOB({dims}))"),
+                        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
                         (),
-                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db create table: {e}")))?;
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db meta: {e}")))?;
 
-                    for (i, emb) in embeddings[..chunk_metas.len()].iter().enumerate() {
-                        let emb_json = serde_json::to_string(emb)
-                            .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
-                        conn.execute(
-                            "INSERT INTO chunks (id, key_idx, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
-                            libsql::params![i as i64, chunk_metas[i].key_idx as i64, chunk_metas[i].text.clone(), emb_json],
-                        ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert: {e}")))?;
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS files (s3_key TEXT PRIMARY KEY, etag TEXT)",
+                        (),
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db files: {e}")))?;
+
+                    // Get a single embedding to determine dimensions
+                    let dim_probe = llm.embed(&[query.to_string()])
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+                    if dim_probe.is_empty() || dim_probe[0].is_empty() {
+                        return Ok("(no embeddings returned)".into());
+                    }
+                    let dims = dim_probe[0].len();
+                    if dims > 10000 {
+                        return Err(ToolError::ExecutionFailed(format!("unexpected embedding dimensions: {dims}")));
+                    }
+                    let query_embedding = &dim_probe[0];
+
+                    // Check if stored dimension matches; if not, rebuild
+                    let mut stored_dims: Option<usize> = None;
+                    let mut rows = conn.query("SELECT value FROM meta WHERE key = 'embedding_dim'", ())
+                        .await.map_err(|e| ToolError::ExecutionFailed(format!("db meta read: {e}")))?;
+                    if let Some(row) = rows.next().await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db meta row: {e}")))? {
+                        let v: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("meta get: {e}")))?;
+                        stored_dims = v.parse().ok();
                     }
 
-                    // 5. Search
+                    if stored_dims != Some(dims) {
+                        // Dimension changed — drop and recreate chunks table
+                        conn.execute("DROP TABLE IF EXISTS chunks", ()).await
+                            .map_err(|e| ToolError::ExecutionFailed(format!("db drop: {e}")))?;
+                        conn.execute("DELETE FROM files", ()).await
+                            .map_err(|e| ToolError::ExecutionFailed(format!("db clear files: {e}")))?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dim', ?1)",
+                            libsql::params![dims.to_string()],
+                        ).await.map_err(|e| ToolError::ExecutionFailed(format!("db meta write: {e}")))?;
+                    }
+
+                    conn.execute(
+                        &format!("CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, s3_key TEXT, chunk_text TEXT, embedding F32_BLOB({dims}))"),
+                        (),
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db create chunks: {e}")))?;
+
+                    // 4. Diff: compare S3 ETags against cached files
+                    let mut cached: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                    let mut rows = conn.query("SELECT s3_key, etag FROM files", ())
+                        .await.map_err(|e| ToolError::ExecutionFailed(format!("db files read: {e}")))?;
+                    while let Some(row) = rows.next().await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db files row: {e}")))? {
+                        let k: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("row: {e}")))?;
+                        let e: String = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row: {e}")))?;
+                        cached.insert(k, e);
+                    }
+
+                    let s3_keys: std::collections::HashSet<&str> = s3_entries.iter().map(|e| e.key.as_str()).collect();
+
+                    // Delete stale keys (removed from S3 or etag changed)
+                    let mut stale_keys: Vec<String> = Vec::new();
+                    for (cached_key, cached_etag) in &cached {
+                        if !s3_keys.contains(cached_key.as_str()) {
+                            stale_keys.push(cached_key.clone());
+                        } else if let Some(entry) = s3_entries.iter().find(|e| &e.key == cached_key) {
+                            if entry.etag != *cached_etag {
+                                stale_keys.push(cached_key.clone());
+                            }
+                        }
+                    }
+                    for key in &stale_keys {
+                        conn.execute("DELETE FROM chunks WHERE s3_key = ?1", libsql::params![key.clone()])
+                            .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete chunks: {e}")))?;
+                        conn.execute("DELETE FROM files WHERE s3_key = ?1", libsql::params![key.clone()])
+                            .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete file: {e}")))?;
+                    }
+
+                    // Identify new keys (not in cache, or were stale and just deleted)
+                    let new_entries: Vec<&S3Entry> = s3_entries.iter()
+                        .filter(|e| !cached.contains_key(&e.key) || stale_keys.contains(&e.key))
+                        .collect();
+
+                    // 5. Download, chunk, and embed new/changed files
+                    let fresh_count = s3_entries.len() - new_entries.len();
+                    tracing::info!(
+                        total = s3_entries.len(),
+                        cached = fresh_count,
+                        new = new_entries.len() - stale_keys.len(),
+                        stale = stale_keys.len(),
+                        "search index sync",
+                    );
+
+                    if !new_entries.is_empty() {
+                        use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
+
+                        struct NewChunk {
+                            s3_key: String,
+                            text: String,
+                        }
+
+                        let mut new_chunks: Vec<NewChunk> = Vec::new();
+                        for entry in &new_entries {
+                            let response = self.bucket
+                                .get_object(&entry.key)
+                                .await
+                                .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
+                            let body = String::from_utf8_lossy(response.bytes()).to_string();
+                            let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
+                            for chunk in chunks {
+                                new_chunks.push(NewChunk { s3_key: entry.key.clone(), text: chunk.text });
+                            }
+                        }
+
+                        if !new_chunks.is_empty() {
+                            let texts: Vec<String> = new_chunks.iter().map(|c| c.text.clone()).collect();
+                            let embeddings = llm.embed(&texts)
+                                .await
+                                .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+
+                            for (i, emb) in embeddings.iter().enumerate() {
+                                let emb_json = serde_json::to_string(emb)
+                                    .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+                                conn.execute(
+                                    "INSERT INTO chunks (s3_key, chunk_text, embedding) VALUES (?1, ?2, vector32(?3))",
+                                    libsql::params![new_chunks[i].s3_key.clone(), new_chunks[i].text.clone(), emb_json],
+                                ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert chunk: {e}")))?;
+                            }
+                        }
+
+                        // Update files table with new ETags
+                        for entry in &new_entries {
+                            conn.execute(
+                                "INSERT OR REPLACE INTO files (s3_key, etag) VALUES (?1, ?2)",
+                                libsql::params![entry.key.clone(), entry.etag.clone()],
+                            ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
+                        }
+                    }
+
+                    // 6. Query
                     let query_json = serde_json::to_string(query_embedding)
                         .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
 
                     let mut rows = conn.query(
-                        "SELECT id, key_idx, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
+                        "SELECT s3_key, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
                         libsql::params![query_json],
                     ).await.map_err(|e| ToolError::ExecutionFailed(format!("db query: {e}")))?;
 
                     let mut output: Vec<serde_json::Value> = Vec::new();
                     while let Some(row) = rows.next().await
                         .map_err(|e| ToolError::ExecutionFailed(format!("db row: {e}")))? {
-                        let key_idx: i64 = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
-                        let chunk_text: String = row.get(2).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
-                        let distance: f64 = row.get(3).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
-                        let k = &keys[key_idx as usize];
+                        let s3_key: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+                        let chunk_text: String = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+                        let distance: f64 = row.get(2).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
                         let similarity = 1.0 - distance;
                         output.push(serde_json::json!({
-                            "path": k,
+                            "path": s3_key,
                             "cosine_similarity": (similarity * 1000.0).round() / 1000.0,
                             "chunk": chunk_text,
                         }));

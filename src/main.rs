@@ -530,6 +530,15 @@ async fn main() {
         }
 
         Commands::Tool { tool_name, args } => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn".into()),
+                )
+                .with_target(false)
+                .without_time()
+                .init();
+
             let cfg = match load_config() {
                 Ok(cfg) => cfg,
                 Err(e) => {
