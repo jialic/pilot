@@ -373,44 +373,56 @@ impl Tool for S3Tool {
                     }
 
                     let dims = embeddings[0].len();
+                    if dims == 0 || dims > 10000 {
+                        return Err(ToolError::ExecutionFailed(format!("unexpected embedding dimensions: {dims}")));
+                    }
                     let query_embedding = embeddings.last()
                         .ok_or_else(|| ToolError::ExecutionFailed("no query embedding".into()))?;
 
-                    // 4. Build usearch index in memory
-                    use usearch::Index;
-                    let index = Index::new(&usearch::IndexOptions {
-                        dimensions: dims,
-                        metric: usearch::MetricKind::Cos,
-                        quantization: usearch::ScalarKind::F32,
-                        ..Default::default()
-                    }).map_err(|e| ToolError::ExecutionFailed(format!("index create: {e}")))?;
+                    // 4. Build libSQL in-memory db with vectors
+                    let db = libsql::Builder::new_local(":memory:")
+                        .build().await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db create: {e}")))?;
+                    let conn = db.connect()
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db connect: {e}")))?;
 
-                    index.reserve(chunk_metas.len())
-                        .map_err(|e| ToolError::ExecutionFailed(format!("index reserve: {e}")))?;
+                    conn.execute(
+                        &format!("CREATE TABLE chunks (id INTEGER PRIMARY KEY, key_idx INTEGER, chunk_text TEXT, embedding F32_BLOB({dims}))"),
+                        (),
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db create table: {e}")))?;
 
                     for (i, emb) in embeddings[..chunk_metas.len()].iter().enumerate() {
-                        index.add(i as u64, emb)
-                            .map_err(|e| ToolError::ExecutionFailed(format!("index add: {e}")))?;
+                        let emb_json = serde_json::to_string(emb)
+                            .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+                        conn.execute(
+                            "INSERT INTO chunks (id, key_idx, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
+                            libsql::params![i as i64, chunk_metas[i].key_idx as i64, chunk_metas[i].text.clone(), emb_json],
+                        ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert: {e}")))?;
                     }
 
                     // 5. Search
-                    let results = index.search(query_embedding, 10)
-                        .map_err(|e| ToolError::ExecutionFailed(format!("index search: {e}")))?;
+                    let query_json = serde_json::to_string(query_embedding)
+                        .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
 
-                    let output: Vec<serde_json::Value> = results.keys.iter()
-                        .zip(results.distances.iter())
-                        .map(|(key, distance)| {
-                            let i = *key as usize;
-                            let meta = &chunk_metas[i];
-                            let k = &keys[meta.key_idx];
-                            let similarity = 1.0 - distance;
-                            serde_json::json!({
-                                "path": k,
-                                "cosine_similarity": (similarity * 1000.0).round() / 1000.0,
-                                "chunk": meta.text,
-                            })
-                        })
-                        .collect();
+                    let mut rows = conn.query(
+                        "SELECT id, key_idx, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
+                        libsql::params![query_json],
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db query: {e}")))?;
+
+                    let mut output: Vec<serde_json::Value> = Vec::new();
+                    while let Some(row) = rows.next().await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("db row: {e}")))? {
+                        let key_idx: i64 = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+                        let chunk_text: String = row.get(2).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+                        let distance: f64 = row.get(3).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+                        let k = &keys[key_idx as usize];
+                        let similarity = 1.0 - distance;
+                        output.push(serde_json::json!({
+                            "path": k,
+                            "cosine_similarity": (similarity * 1000.0).round() / 1000.0,
+                            "chunk": chunk_text,
+                        }));
+                    }
 
                     Ok(serde_json::to_string_pretty(&output)
                         .unwrap_or_else(|_| "[]".into()))
