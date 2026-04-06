@@ -1,4 +1,5 @@
 mod anthropic;
+mod duration;
 mod gemini;
 mod openai;
 mod xai;

@@ -334,6 +334,8 @@ impl Tool for S3Tool {
                     struct S3Entry {
                         key: String,
                         etag: String,
+                        size: u64,
+                        last_modified: String,
                     }
 
                     let mut s3_entries: Vec<S3Entry> = Vec::new();
@@ -343,6 +345,8 @@ impl Tool for S3Tool {
                                 s3_entries.push(S3Entry {
                                     key: obj.key.clone(),
                                     etag: obj.e_tag.clone().unwrap_or_default(),
+                                    size: obj.size,
+                                    last_modified: obj.last_modified.clone(),
                                 });
                             }
                         }
@@ -369,56 +373,19 @@ impl Tool for S3Tool {
                     let conn = db.connect()
                         .map_err(|e| ToolError::ExecutionFailed(format!("db connect: {e}")))?;
 
-                    // 3. Ensure schema exists + check embedding dimension
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
-                        (),
-                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db meta: {e}")))?;
+                    // Run schema migrations
+                    super::migrate::run_s3_migrations(&conn, &db_path)
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(e))?;
 
-                    conn.execute(
-                        "CREATE TABLE IF NOT EXISTS files (s3_key TEXT PRIMARY KEY, etag TEXT)",
-                        (),
-                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db files: {e}")))?;
-
-                    // Get a single embedding to determine dimensions
-                    let dim_probe = llm.embed(&[query.to_string()])
+                    // Embed the query
+                    let query_embeddings = llm.embed(&[query.to_string()])
                         .await
                         .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
-                    if dim_probe.is_empty() || dim_probe[0].is_empty() {
+                    if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
                         return Ok("(no embeddings returned)".into());
                     }
-                    let dims = dim_probe[0].len();
-                    if dims > 10000 {
-                        return Err(ToolError::ExecutionFailed(format!("unexpected embedding dimensions: {dims}")));
-                    }
-                    let query_embedding = &dim_probe[0];
-
-                    // Check if stored dimension matches; if not, rebuild
-                    let mut stored_dims: Option<usize> = None;
-                    let mut rows = conn.query("SELECT value FROM meta WHERE key = 'embedding_dim'", ())
-                        .await.map_err(|e| ToolError::ExecutionFailed(format!("db meta read: {e}")))?;
-                    if let Some(row) = rows.next().await
-                        .map_err(|e| ToolError::ExecutionFailed(format!("db meta row: {e}")))? {
-                        let v: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("meta get: {e}")))?;
-                        stored_dims = v.parse().ok();
-                    }
-
-                    if stored_dims != Some(dims) {
-                        // Dimension changed — drop and recreate chunks table
-                        conn.execute("DROP TABLE IF EXISTS chunks", ()).await
-                            .map_err(|e| ToolError::ExecutionFailed(format!("db drop: {e}")))?;
-                        conn.execute("DELETE FROM files", ()).await
-                            .map_err(|e| ToolError::ExecutionFailed(format!("db clear files: {e}")))?;
-                        conn.execute(
-                            "INSERT OR REPLACE INTO meta (key, value) VALUES ('embedding_dim', ?1)",
-                            libsql::params![dims.to_string()],
-                        ).await.map_err(|e| ToolError::ExecutionFailed(format!("db meta write: {e}")))?;
-                    }
-
-                    conn.execute(
-                        &format!("CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, s3_key TEXT, chunk_text TEXT, embedding F32_BLOB({dims}))"),
-                        (),
-                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db create chunks: {e}")))?;
+                    let query_embedding = &query_embeddings[0];
 
                     // 4. Diff: compare S3 ETags against cached files
                     let mut cached: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -471,6 +438,7 @@ impl Tool for S3Tool {
 
                         struct NewChunk {
                             s3_key: String,
+                            offset: usize,
                             text: String,
                         }
 
@@ -483,7 +451,11 @@ impl Tool for S3Tool {
                             let body = String::from_utf8_lossy(response.bytes()).to_string();
                             let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
                             for chunk in chunks {
-                                new_chunks.push(NewChunk { s3_key: entry.key.clone(), text: chunk.text });
+                                new_chunks.push(NewChunk {
+                                    s3_key: entry.key.clone(),
+                                    offset: chunk.offset,
+                                    text: chunk.text,
+                                });
                             }
                         }
 
@@ -497,17 +469,17 @@ impl Tool for S3Tool {
                                 let emb_json = serde_json::to_string(emb)
                                     .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
                                 conn.execute(
-                                    "INSERT INTO chunks (s3_key, chunk_text, embedding) VALUES (?1, ?2, vector32(?3))",
-                                    libsql::params![new_chunks[i].s3_key.clone(), new_chunks[i].text.clone(), emb_json],
+                                    "INSERT INTO chunks (s3_key, chunk_offset, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
+                                    libsql::params![new_chunks[i].s3_key.clone(), new_chunks[i].offset as i64, new_chunks[i].text.clone(), emb_json],
                                 ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert chunk: {e}")))?;
                             }
                         }
 
-                        // Update files table with new ETags
+                        // Update files table
                         for entry in &new_entries {
                             conn.execute(
-                                "INSERT OR REPLACE INTO files (s3_key, etag) VALUES (?1, ?2)",
-                                libsql::params![entry.key.clone(), entry.etag.clone()],
+                                "INSERT OR REPLACE INTO files (s3_key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
+                                libsql::params![entry.key.clone(), entry.etag.clone(), entry.size as i64, entry.last_modified.clone()],
                             ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
                         }
                     }

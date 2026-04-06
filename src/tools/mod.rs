@@ -5,6 +5,7 @@ pub mod dispatcher;
 pub mod file;
 pub mod http;
 pub mod input;
+pub mod migrate;
 pub mod s3;
 pub mod shell;
 pub mod submit_fields;

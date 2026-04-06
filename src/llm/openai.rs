@@ -1,4 +1,5 @@
 use super::{ChatMessage, ChatResponse, FunctionCall, LlmError, ToolCall, ToolDefinition};
+use super::duration::parse_go_duration;
 
 pub struct OpenAIClient {
     client: reqwest::Client,
@@ -102,48 +103,79 @@ impl OpenAIClient {
     }
 
     pub async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
-        let body = serde_json::json!({
-            "model": "text-embedding-3-small",
-            "input": texts,
-        });
+        const BATCH_SIZE: usize = 100;
+        const MAX_RETRIES: u32 = 5;
+        let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
 
-        let response = self.client
-            .post("https://api.openai.com/v1/embeddings")
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+        for batch in texts.chunks(BATCH_SIZE) {
+            let body = serde_json::json!({
+                "model": "text-embedding-3-small",
+                "input": batch,
+            });
 
-        let status = response.status();
-        let text = response.text().await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+            let mut retries = 0;
+            let (status, text) = loop {
+                let response = self.client
+                    .post("https://api.openai.com/v1/embeddings")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
 
-        if !status.is_success() {
-            return Err(LlmError::RequestFailed(format!("embedding HTTP {status}: {text}")));
+                let status = response.status();
+
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS && retries < MAX_RETRIES {
+                    retries += 1;
+                    let raw_header = response.headers()
+                        .get("x-ratelimit-reset-tokens")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let wait = raw_header.as_deref()
+                        .and_then(parse_go_duration)
+                        .unwrap_or(std::time::Duration::from_secs(5));
+                    tracing::warn!(
+                        header = raw_header.as_deref().unwrap_or("(missing)"),
+                        "embedding rate limited, retry {retries}/{MAX_RETRIES} in {wait:?}",
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+
+                let text = response.text().await
+                    .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+                break (status, text);
+            };
+
+            if !status.is_success() {
+                return Err(LlmError::RequestFailed(format!("embedding HTTP {status}: {text}")));
+            }
+
+            let resp: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| LlmError::ParseError(format!("embedding parse: {e}")))?;
+
+            let embeddings = resp["data"]
+                .as_array()
+                .ok_or_else(|| LlmError::ParseError("no data in embedding response".into()))?
+                .iter()
+                .map(|item| {
+                    item["embedding"]
+                        .as_array()
+                        .ok_or_else(|| LlmError::ParseError("no embedding vector".into()))
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                                .collect()
+                        })
+                })
+                .collect::<Result<Vec<Vec<f32>>, _>>()?;
+
+            all_embeddings.extend(embeddings);
         }
 
-        let resp: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| LlmError::ParseError(format!("embedding parse: {e}")))?;
-
-        let embeddings = resp["data"]
-            .as_array()
-            .ok_or_else(|| LlmError::ParseError("no data in embedding response".into()))?
-            .iter()
-            .map(|item| {
-                item["embedding"]
-                    .as_array()
-                    .ok_or_else(|| LlmError::ParseError("no embedding vector".into()))
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_f64().map(|f| f as f32))
-                            .collect()
-                    })
-            })
-            .collect::<Result<Vec<Vec<f32>>, _>>()?;
-
-        Ok(embeddings)
+        Ok(all_embeddings)
     }
 
     pub async fn call(
