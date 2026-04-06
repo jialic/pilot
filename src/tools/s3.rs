@@ -93,6 +93,42 @@ impl S3Tool {
     }
 }
 
+struct S3Entry {
+    key: String,
+    etag: String,
+}
+
+struct IndexDiff {
+    /// Keys to remove from the index (deleted from S3 or etag changed).
+    stale: Vec<String>,
+    /// Indices into the entries slice that need (re-)indexing.
+    new: Vec<usize>,
+}
+
+/// Compare current S3 entries against cached (key → etag) map.
+fn diff_index(entries: &[S3Entry], cached: &std::collections::HashMap<String, String>) -> IndexDiff {
+    let s3_keys: std::collections::HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+
+    let mut stale: Vec<String> = Vec::new();
+    for (cached_key, cached_etag) in cached {
+        if !s3_keys.contains(cached_key.as_str()) {
+            stale.push(cached_key.clone());
+        } else if let Some(entry) = entries.iter().find(|e| &e.key == cached_key) {
+            if entry.etag != *cached_etag {
+                stale.push(cached_key.clone());
+            }
+        }
+    }
+
+    let stale_set: std::collections::HashSet<&str> = stale.iter().map(|s| s.as_str()).collect();
+    let new: Vec<usize> = entries.iter().enumerate()
+        .filter(|(_, e)| !cached.contains_key(&e.key) || stale_set.contains(e.key.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+
+    IndexDiff { stale, new }
+}
+
 fn is_text_file(key: &str) -> bool {
     matches!(
         key.rsplit('.').next(),
@@ -330,13 +366,6 @@ impl Tool for S3Tool {
                         .await
                         .map_err(|e| ToolError::ExecutionFailed(format!("S3 list failed: {e}")))?;
 
-                    struct S3Entry {
-                        key: String,
-                        etag: String,
-                        size: u64,
-                        last_modified: String,
-                    }
-
                     let mut s3_entries: Vec<S3Entry> = Vec::new();
                     for result in &results {
                         for obj in &result.contents {
@@ -344,8 +373,6 @@ impl Tool for S3Tool {
                                 s3_entries.push(S3Entry {
                                     key: obj.key.clone(),
                                     etag: obj.e_tag.clone().unwrap_or_default(),
-                                    size: obj.size,
-                                    last_modified: obj.last_modified.clone(),
                                 });
                             }
                         }
@@ -384,20 +411,9 @@ impl Tool for S3Tool {
                         cached.insert(k, e);
                     }
 
-                    let s3_keys: std::collections::HashSet<&str> = s3_entries.iter().map(|e| e.key.as_str()).collect();
+                    let diff = diff_index(&s3_entries, &cached);
 
-                    // Delete stale keys (removed from S3 or etag changed)
-                    let mut stale_keys: Vec<String> = Vec::new();
-                    for (cached_key, cached_etag) in &cached {
-                        if !s3_keys.contains(cached_key.as_str()) {
-                            stale_keys.push(cached_key.clone());
-                        } else if let Some(entry) = s3_entries.iter().find(|e| &e.key == cached_key) {
-                            if entry.etag != *cached_etag {
-                                stale_keys.push(cached_key.clone());
-                            }
-                        }
-                    }
-                    for key in &stale_keys {
+                    for key in &diff.stale {
                         conn.execute("DELETE FROM chunks WHERE s3_key = ?1", libsql::params![key.clone()])
                             .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete chunks: {e}")))?;
                         conn.execute("DELETE FROM files WHERE s3_key = ?1", libsql::params![key.clone()])
@@ -417,22 +433,16 @@ impl Tool for S3Tool {
                     }
                     let query_embedding = &query_embeddings[0];
 
-                    // Identify new keys (not in cache, or were stale and just deleted)
-                    let new_entries: Vec<&S3Entry> = s3_entries.iter()
-                        .filter(|e| !cached.contains_key(&e.key) || stale_keys.contains(&e.key))
-                        .collect();
-
-                    // 5. Download, chunk, and embed new/changed files
-                    let fresh_count = s3_entries.len() - new_entries.len();
+                    // 4. Download, chunk, and embed new/changed files
                     tracing::info!(
                         total = s3_entries.len(),
-                        cached = fresh_count,
-                        new = new_entries.len() - stale_keys.len(),
-                        stale = stale_keys.len(),
+                        cached = s3_entries.len() - diff.new.len(),
+                        new = diff.new.len() - diff.stale.len(),
+                        stale = diff.stale.len(),
                         "search index sync",
                     );
 
-                    if !new_entries.is_empty() {
+                    if !diff.new.is_empty() {
                         use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
 
                         struct NewChunk {
@@ -442,7 +452,8 @@ impl Tool for S3Tool {
                         }
 
                         let mut new_chunks: Vec<NewChunk> = Vec::new();
-                        for entry in &new_entries {
+                        for &idx in &diff.new {
+                            let entry = &s3_entries[idx];
                             let response = self.bucket
                                 .get_object(&entry.key)
                                 .await
@@ -475,10 +486,11 @@ impl Tool for S3Tool {
                         }
 
                         // Update files table
-                        for entry in &new_entries {
+                        for &idx in &diff.new {
+                            let entry = &s3_entries[idx];
                             conn.execute(
-                                "INSERT OR REPLACE INTO files (s3_key, etag, size, last_modified) VALUES (?1, ?2, ?3, ?4)",
-                                libsql::params![entry.key.clone(), entry.etag.clone(), entry.size as i64, entry.last_modified.clone()],
+                                "INSERT OR REPLACE INTO files (s3_key, etag) VALUES (?1, ?2)",
+                                libsql::params![entry.key.clone(), entry.etag.clone()],
                             ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
                         }
                     }
@@ -514,6 +526,126 @@ impl Tool for S3Tool {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn entry(key: &str, etag: &str) -> S3Entry {
+        S3Entry { key: key.into(), etag: etag.into() }
+    }
+
+    #[test]
+    fn empty_both() {
+        let diff = diff_index(&[], &HashMap::new());
+        assert!(diff.stale.is_empty());
+        assert!(diff.new.is_empty());
+    }
+
+    #[test]
+    fn all_new() {
+        let entries = vec![entry("a.md", "e1"), entry("b.md", "e2")];
+        let diff = diff_index(&entries, &HashMap::new());
+        assert!(diff.stale.is_empty());
+        assert_eq!(diff.new, vec![0, 1]);
+    }
+
+    #[test]
+    fn all_cached() {
+        let entries = vec![entry("a.md", "e1"), entry("b.md", "e2")];
+        let cached: HashMap<String, String> = [
+            ("a.md".into(), "e1".into()),
+            ("b.md".into(), "e2".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        assert!(diff.stale.is_empty());
+        assert!(diff.new.is_empty());
+    }
+
+    #[test]
+    fn deleted_file() {
+        let entries = vec![entry("a.md", "e1")];
+        let cached: HashMap<String, String> = [
+            ("a.md".into(), "e1".into()),
+            ("gone.md".into(), "e9".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        assert_eq!(diff.stale, vec!["gone.md"]);
+        assert!(diff.new.is_empty());
+    }
+
+    #[test]
+    fn etag_changed() {
+        let entries = vec![entry("a.md", "e2")];
+        let cached: HashMap<String, String> = [
+            ("a.md".into(), "e1".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        assert_eq!(diff.stale, vec!["a.md"]);
+        assert_eq!(diff.new, vec![0]);
+    }
+
+    #[test]
+    fn permission_revoked() {
+        // File exists in cache but not in entries (filtered out by permission)
+        let entries = vec![entry("public.md", "e1")];
+        let cached: HashMap<String, String> = [
+            ("public.md".into(), "e1".into()),
+            ("secret.md".into(), "e5".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        assert_eq!(diff.stale, vec!["secret.md"]);
+        assert!(diff.new.is_empty());
+    }
+
+    #[test]
+    fn all_permissions_lost() {
+        // No readable entries but cache has files — everything stale
+        let cached: HashMap<String, String> = [
+            ("a.md".into(), "e1".into()),
+            ("b.md".into(), "e2".into()),
+        ].into();
+        let diff = diff_index(&[], &cached);
+        let mut stale = diff.stale.clone();
+        stale.sort();
+        assert_eq!(stale, vec!["a.md", "b.md"]);
+        assert!(diff.new.is_empty());
+    }
+
+    #[test]
+    fn all_modified() {
+        let entries = vec![entry("a.md", "e2"), entry("b.md", "e4")];
+        let cached: HashMap<String, String> = [
+            ("a.md".into(), "e1".into()),
+            ("b.md".into(), "e3".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        let mut stale = diff.stale.clone();
+        stale.sort();
+        assert_eq!(stale, vec!["a.md", "b.md"]);
+        assert_eq!(diff.new, vec![0, 1]);
+    }
+
+    #[test]
+    fn mixed_new_stale_unchanged() {
+        let entries = vec![
+            entry("unchanged.md", "e1"),
+            entry("modified.md", "e3"),
+            entry("brand_new.md", "e4"),
+        ];
+        let cached: HashMap<String, String> = [
+            ("unchanged.md".into(), "e1".into()),
+            ("modified.md".into(), "e2".into()),
+            ("deleted.md".into(), "e9".into()),
+        ].into();
+        let diff = diff_index(&entries, &cached);
+        let mut stale = diff.stale.clone();
+        stale.sort();
+        assert_eq!(stale, vec!["deleted.md", "modified.md"]);
+        assert_eq!(diff.new, vec![1, 2]); // modified + brand_new
     }
 }
 
