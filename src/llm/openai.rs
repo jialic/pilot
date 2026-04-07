@@ -132,9 +132,11 @@ impl OpenAIClient {
                         .get("x-ratelimit-reset-tokens")
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
-                    let wait = raw_header.as_deref()
+                    let base = raw_header.as_deref()
                         .and_then(parse_go_duration)
                         .unwrap_or(std::time::Duration::from_secs(5));
+                    let jitter = std::time::Duration::from_secs(1 + rand::random::<u64>() % 5);
+                    let wait = base + jitter;
                     tracing::warn!(
                         header = raw_header.as_deref().unwrap_or("(missing)"),
                         "embedding rate limited, retry {retries}/{MAX_RETRIES} in {wait:?}",

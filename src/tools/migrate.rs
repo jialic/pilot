@@ -12,6 +12,12 @@ const S3_MIGRATIONS: &[(u32, &[&str])] = &[
         "CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, s3_key TEXT NOT NULL, chunk_offset INTEGER, chunk_text TEXT NOT NULL, embedding F32_BLOB(1536) NOT NULL)",
         "CREATE INDEX idx_chunks_s3_key ON chunks(s3_key)",
     ]),
+    // 1 → 2: add foreign key with CASCADE delete on chunks
+    (1, &[
+        "DROP TABLE chunks",
+        "CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, s3_key TEXT NOT NULL REFERENCES files(s3_key) ON DELETE CASCADE, chunk_offset INTEGER, chunk_text TEXT NOT NULL, embedding F32_BLOB(1536) NOT NULL)",
+        "CREATE INDEX idx_chunks_s3_key ON chunks(s3_key)",
+    ]),
 ];
 
 /// Run pending migrations on the S3 cache database.

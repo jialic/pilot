@@ -394,6 +394,8 @@ impl Tool for S3Tool {
                         .map_err(|e| ToolError::ExecutionFailed(format!("db open: {e}")))?;
                     let conn = db.connect()
                         .map_err(|e| ToolError::ExecutionFailed(format!("db connect: {e}")))?;
+                    conn.execute("PRAGMA foreign_keys = ON", ())
+                        .await.map_err(|e| ToolError::ExecutionFailed(format!("pragma: {e}")))?;
 
                     // Run schema migrations
                     super::migrate::run_s3_migrations(&conn, &db_path)
@@ -414,8 +416,6 @@ impl Tool for S3Tool {
                     let diff = diff_index(&s3_entries, &cached);
 
                     for key in &diff.stale {
-                        conn.execute("DELETE FROM chunks WHERE s3_key = ?1", libsql::params![key.clone()])
-                            .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete chunks: {e}")))?;
                         conn.execute("DELETE FROM files WHERE s3_key = ?1", libsql::params![key.clone()])
                             .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete file: {e}")))?;
                     }
@@ -423,15 +423,6 @@ impl Tool for S3Tool {
                     if s3_entries.is_empty() {
                         return Ok("(no searchable objects found)".into());
                     }
-
-                    // Embed the query
-                    let query_embeddings = llm.embed(&[query.to_string()])
-                        .await
-                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
-                    if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
-                        return Ok("(no embeddings returned)".into());
-                    }
-                    let query_embedding = &query_embeddings[0];
 
                     // 4. Download, chunk, and embed new/changed files
                     tracing::info!(
@@ -444,58 +435,73 @@ impl Tool for S3Tool {
 
                     if !diff.new.is_empty() {
                         use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
+                        use futures::stream::{self, StreamExt};
 
-                        struct NewChunk {
-                            s3_key: String,
-                            offset: usize,
-                            text: String,
-                        }
+                        let tasks: Vec<_> = diff.new.iter().map(|&idx| {
+                            (s3_entries[idx].key.clone(), s3_entries[idx].etag.clone())
+                        }).collect();
 
-                        let mut new_chunks: Vec<NewChunk> = Vec::new();
-                        for &idx in &diff.new {
-                            let entry = &s3_entries[idx];
-                            let response = self.bucket
-                                .get_object(&entry.key)
-                                .await
-                                .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
-                            let body = String::from_utf8_lossy(response.bytes()).to_string();
-                            let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
-                            for chunk in chunks {
-                                new_chunks.push(NewChunk {
-                                    s3_key: entry.key.clone(),
-                                    offset: chunk.offset,
-                                    text: chunk.text,
-                                });
-                            }
-                        }
+                        let results: Vec<Result<(), ToolError>> = stream::iter(tasks.into_iter().map(|(key, etag)| {
+                            let bucket = self.bucket.clone();
+                            let llm = llm.clone();
+                            let conn = conn.clone();
+                            async move {
+                                let response = bucket
+                                    .get_object(&key)
+                                    .await
+                                    .map_err(|e| ToolError::ExecutionFailed(format!("S3 read failed: {e}")))?;
+                                let body = String::from_utf8_lossy(response.bytes()).to_string();
+                                let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
 
-                        if !new_chunks.is_empty() {
-                            let texts: Vec<String> = new_chunks.iter().map(|c| c.text.clone()).collect();
-                            let embeddings = llm.embed(&texts)
-                                .await
-                                .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
-
-                            for (i, emb) in embeddings.iter().enumerate() {
-                                let emb_json = serde_json::to_string(emb)
-                                    .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+                                // Insert file with empty etag placeholder (satisfies FK for chunks)
                                 conn.execute(
-                                    "INSERT INTO chunks (s3_key, chunk_offset, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
-                                    libsql::params![new_chunks[i].s3_key.clone(), new_chunks[i].offset as i64, new_chunks[i].text.clone(), emb_json],
-                                ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert chunk: {e}")))?;
-                            }
-                        }
+                                    "INSERT OR REPLACE INTO files (s3_key, etag) VALUES (?1, '')",
+                                    libsql::params![key.clone()],
+                                ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
 
-                        // Update files table
-                        for &idx in &diff.new {
-                            let entry = &s3_entries[idx];
-                            conn.execute(
-                                "INSERT OR REPLACE INTO files (s3_key, etag) VALUES (?1, ?2)",
-                                libsql::params![entry.key.clone(), entry.etag.clone()],
-                            ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
+                                if !chunks.is_empty() {
+                                    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+                                    let embeddings = llm.embed(&texts)
+                                        .await
+                                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+
+                                    for (i, emb) in embeddings.iter().enumerate() {
+                                        let emb_json = serde_json::to_string(emb)
+                                            .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+                                        conn.execute(
+                                            "INSERT INTO chunks (s3_key, chunk_offset, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
+                                            libsql::params![key.clone(), chunks[i].offset as i64, chunks[i].text.clone(), emb_json],
+                                        ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert chunk: {e}")))?;
+                                    }
+                                }
+
+                                // Set real etag — marks file as fully indexed
+                                conn.execute(
+                                    "UPDATE files SET etag = ?1 WHERE s3_key = ?2",
+                                    libsql::params![etag.clone(), key.clone()],
+                                ).await.map_err(|e| ToolError::ExecutionFailed(format!("db update etag: {e}")))?;
+
+                                Ok(())
+                            }
+                        }))
+                        .buffer_unordered(4)
+                        .collect()
+                        .await;
+
+                        for result in results {
+                            result?;
                         }
                     }
 
-                    // 6. Query
+                    // 5. Embed query and search
+                    let query_embeddings = llm.embed(&[query.to_string()])
+                        .await
+                        .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+                    if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
+                        return Ok("(no embeddings returned)".into());
+                    }
+                    let query_embedding = &query_embeddings[0];
+
                     let query_json = serde_json::to_string(query_embedding)
                         .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
 
