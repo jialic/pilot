@@ -182,7 +182,7 @@ impl Tool for S3Tool {
                         },
                         "overwrite": {
                             "type": "object",
-                            "description": "Write full object content. Creates if missing.",
+                            "description": "Write mode: write full object content. Creates if missing.",
                             "properties": {
                                 "content": { "type": "string", "description": "Full object content" }
                             },
@@ -190,7 +190,7 @@ impl Tool for S3Tool {
                         },
                         "append": {
                             "type": "object",
-                            "description": "Append to end of object. Creates if missing.",
+                            "description": "Write mode: append to end of object. Creates if missing.",
                             "properties": {
                                 "content": { "type": "string", "description": "Text to append" }
                             },
@@ -198,7 +198,7 @@ impl Tool for S3Tool {
                         },
                         "edit": {
                             "type": "object",
-                            "description": "Find and replace text in an existing object.",
+                            "description": "Write mode: find and replace text in an existing object.",
                             "properties": {
                                 "search": { "type": "string", "description": "Exact text to find" },
                                 "replace": { "type": "string", "description": "Text to replace it with" }

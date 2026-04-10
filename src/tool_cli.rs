@@ -102,13 +102,12 @@ fn print_tool_help(tool: &dyn crate::tools::Tool) {
                 })
                 .unwrap_or_default();
 
-            // Show nested object properties
             if prop["type"].as_str() == Some("object") {
-                eprintln!("  --{name}{req}  {desc}");
+                eprintln!("  {name}: {desc}");
                 if let Some(sub_props) = prop["properties"].as_object() {
                     for (sub_name, sub_prop) in sub_props {
                         let sub_desc = sub_prop["description"].as_str().unwrap_or("");
-                        eprintln!("    .{sub_name}  {sub_desc}");
+                        eprintln!("    --{name}.{sub_name}  {sub_desc}");
                     }
                 }
             } else {
