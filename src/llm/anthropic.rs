@@ -152,19 +152,43 @@ impl AnthropicClient {
 
         tracing::debug!("Anthropic REQUEST:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-        let response = self.client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+        const MAX_RETRIES: u32 = 5;
+        let mut retries = 0;
 
-        let status = response.status();
-        let text = response.text().await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+        let (status, text) = loop {
+            let response = self.client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+            let status = response.status();
+
+            if matches!(status.as_u16(), 424 | 429 | 500 | 502 | 503 | 529) && retries < MAX_RETRIES {
+                retries += 1;
+                let retry_after = response.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5);
+                let jitter = 1 + rand::random::<u64>() % 5;
+                let wait = std::time::Duration::from_secs(retry_after + jitter);
+                tracing::warn!(
+                    "Anthropic {status}, retry {retries}/{MAX_RETRIES} in {wait:?}",
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            let text = response.text().await
+                .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+            break (status, text);
+        };
 
         if !status.is_success() {
             return Err(LlmError::RequestFailed(format!("HTTP {status}: {text}")));

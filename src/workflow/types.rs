@@ -21,6 +21,8 @@ pub enum WorkflowError {
     #[error("invalid SQL: {0}")]
     InvalidSql(String),
 
+    #[error("invalid tool config: {0}")]
+    InvalidToolConfig(String),
 }
 
 /// Known tool names. Used by actions to specify which tools
@@ -74,8 +76,8 @@ impl ToolName {
                 ("allowed", "Required. List of regex patterns. Command must match at least one. Empty list = nothing allowed."),
             ],
             ToolName::File => vec![
-                ("read", "List of glob patterns for readable paths. Empty list = no read access."),
-                ("write", "List of glob patterns for writable paths. Empty list = no write access."),
+                ("read", "List of glob patterns for readable paths. Paths must be absolute or ~/relative. Empty list = no read access."),
+                ("write", "List of glob patterns for writable paths. Paths must be absolute or ~/relative. Empty list = no write access."),
             ],
             ToolName::S3 => vec![
                 ("bucket", "Required. S3 bucket name."),

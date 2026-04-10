@@ -152,24 +152,60 @@ impl GeminiClient {
             model_name, self.api_key
         );
 
-        let response = self.client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+        const MAX_RETRIES: u32 = 5;
+        let mut retries = 0;
 
-        let status = response.status();
-        let text = response.text().await
-            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+        loop {
+            let response = self.client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
 
-        if !status.is_success() {
-            return Err(LlmError::RequestFailed(format!("HTTP {status}: {text}")));
+            let status = response.status();
+
+            if matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529) && retries < MAX_RETRIES {
+                retries += 1;
+                let retry_after = response.headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5);
+                let jitter = 1 + rand::random::<u64>() % 5;
+                let wait = std::time::Duration::from_secs(retry_after + jitter);
+                tracing::warn!(
+                    "Gemini {status}, retry {retries}/{MAX_RETRIES} in {wait:?}",
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
+            let text = response.text().await
+                .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+            if !status.is_success() {
+                return Err(LlmError::RequestFailed(format!("HTTP {status}: {text}")));
+            }
+
+            tracing::debug!("Gemini RESPONSE:\n{text}");
+            // Gemini sometimes returns 200 with empty content.parts — known bug.
+            // Retry on parse errors since the next attempt usually succeeds.
+            match Self::parse_response(&text) {
+                Err(LlmError::ParseError(msg)) if retries < MAX_RETRIES => {
+                    retries += 1;
+                    let jitter = 1 + rand::random::<u64>() % 5;
+                    let wait = std::time::Duration::from_secs(jitter);
+                    tracing::warn!(
+                        "Gemini parse error ({msg}), retry {retries}/{MAX_RETRIES} in {wait:?}",
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+                other => return other,
+            }
         }
-
-        tracing::debug!("Gemini RESPONSE:\n{text}");
-        Self::parse_response(&text)
     }
 
     fn parse_response(text: &str) -> Result<ChatResponse, LlmError> {

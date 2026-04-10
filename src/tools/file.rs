@@ -119,7 +119,7 @@ impl Tool for FileTool {
             "type": "function",
             "function": {
                 "name": "file",
-                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope_desc}\n\nOperations:\n- read: return file contents. Returns '(file does not exist)' if missing.\n- list: return directory entries, one per line, directories suffixed with /.\n- write: use exactly one of 'overwrite', 'append', or 'edit'. overwrite: write full file content (creates if missing). append: add to end of file (creates if missing). edit: search/replace text in existing file."),
+                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope_desc}\n\nOperations:\n- read: return file contents. Returns '(file does not exist)' if missing.\n- list: return directory entries, one per line, directories suffixed with /.\n- write: set operation to \"write\" AND provide exactly one of the overwrite/append/edit objects.\n\nExamples:\n  Read:  {{\"operation\": \"write\", \"path\": \"~/f.md\", \"overwrite\": {{\"content\": \"hello\"}}}}\n  Edit:  {{\"operation\": \"write\", \"path\": \"~/f.md\", \"edit\": {{\"search\": \"old\", \"replace\": \"new\"}}}}\n  WRONG: {{\"operation\": \"overwrite\", ...}} — overwrite is NOT an operation."),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -138,7 +138,7 @@ impl Tool for FileTool {
                         },
                         "overwrite": {
                             "type": "object",
-                            "description": "Write full file content. Creates file if it doesn't exist.",
+                            "description": "Write mode: write full file content. Creates file if it doesn't exist.",
                             "properties": {
                                 "content": { "type": "string", "description": "Full file content" }
                             },
@@ -146,7 +146,7 @@ impl Tool for FileTool {
                         },
                         "append": {
                             "type": "object",
-                            "description": "Append to end of file. Creates file if it doesn't exist.",
+                            "description": "Write mode: append to end of file. Creates file if it doesn't exist.",
                             "properties": {
                                 "content": { "type": "string", "description": "Text to append" }
                             },
@@ -154,7 +154,7 @@ impl Tool for FileTool {
                         },
                         "edit": {
                             "type": "object",
-                            "description": "Find and replace text in an existing file.",
+                            "description": "Write mode: find and replace text in an existing file.",
                             "properties": {
                                 "search": { "type": "string", "description": "Exact text to find" },
                                 "replace": { "type": "string", "description": "Text to replace it with" }
@@ -301,7 +301,7 @@ impl Tool for FileTool {
                     }
                 }
                 _ => Err(ToolError::ExecutionFailed(
-                    format!("unknown operation: {operation}. Use read, list, or write.")
+                    format!("unknown operation: {operation}. Valid operations: read, list, find, write. Note: overwrite/append/edit are write modes, not operations — use operation: \"write\" with an overwrite/append/edit object.")
                 )),
             }
         })

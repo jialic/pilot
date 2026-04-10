@@ -161,7 +161,7 @@ impl Tool for S3Tool {
             "function": {
                 "name": "s3",
                 "description": format!(
-                    "S3 object storage. Bucket: {}.\n\n{scope_desc}\n\nOperations:\n- list: list objects. Optional 'prefix' to filter.\n- read: get object content by key.\n- write: use exactly one of 'overwrite', 'append', or 'edit'. overwrite: write full content (creates if missing). append: add to end (creates if missing). edit: search/replace text in existing object.\n- delete: remove an object.\n- search: semantic search across all readable objects. Returns top matches ranked by relevance.",
+                    "S3 object storage. Bucket: {}.\n\n{scope_desc}\n\nOperations:\n- list: list objects. Optional 'prefix' to filter.\n- read: get object content by key.\n- write: set operation to \"write\" AND provide exactly one of the overwrite/append/edit objects.\n- delete: remove an object.\n- search: semantic search across all readable objects. Returns top matches ranked by relevance.\n\nExamples:\n  Write: {{\"operation\": \"write\", \"key\": \"f.md\", \"overwrite\": {{\"content\": \"hello\"}}}}\n  Edit:  {{\"operation\": \"write\", \"key\": \"f.md\", \"edit\": {{\"search\": \"old\", \"replace\": \"new\"}}}}\n  WRONG: {{\"operation\": \"overwrite\", ...}} — overwrite is NOT an operation.",
                     self.bucket.name,
                 ),
                 "parameters": {

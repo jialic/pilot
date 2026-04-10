@@ -211,18 +211,42 @@ pub async fn openai_compatible_call(
 
     tracing::debug!("OpenAI-compat REQUEST to {url}:\n{}", serde_json::to_string_pretty(&body).unwrap_or_default());
 
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+    const MAX_RETRIES: u32 = 5;
+    let mut retries = 0;
 
-    let status = response.status();
-    let text = response.text().await
-        .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+    let (status, text) = loop {
+        let response = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+        let status = response.status();
+
+        if matches!(status.as_u16(), 429 | 500 | 502 | 503 | 529) && retries < MAX_RETRIES {
+            retries += 1;
+            let retry_after = response.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            let jitter = 1 + rand::random::<u64>() % 5;
+            let wait = std::time::Duration::from_secs(retry_after + jitter);
+            tracing::warn!(
+                "OpenAI {status}, retry {retries}/{MAX_RETRIES} in {wait:?}",
+            );
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+
+        let text = response.text().await
+            .map_err(|e| LlmError::RequestFailed(e.to_string()))?;
+
+        break (status, text);
+    };
 
     if !status.is_success() {
         return Err(LlmError::RequestFailed(format!("HTTP {status}: {text}")));

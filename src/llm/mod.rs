@@ -263,7 +263,7 @@ pub async fn run_tool_loop(
                 }
                 Err(crate::tools::ToolError::ExecutionFailed(msg)) => {
                     if let Some(l) = listener {
-                        l.on_tool(&ToolEvent::Error);
+                        l.on_tool(&ToolEvent::Error(msg.clone()));
                     }
                     format!("ERROR: {msg}")
                 }
