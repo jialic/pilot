@@ -21,7 +21,7 @@ pub enum ProducerEvent {
 
 /// Events emitted by tools.
 pub enum ToolEvent {
-    Called,
+    Called(String),
     Returned,
     Error(String),
     LlmRequest,
@@ -53,7 +53,7 @@ impl Listener for StderrListener {
 
     fn on_tool(&self, event: &ToolEvent) {
         match event {
-            ToolEvent::Called => eprintln!("  [tool] called"),
+            ToolEvent::Called(name) => eprintln!("  [tool] {name}"),
             ToolEvent::Returned => eprintln!("  [tool] returned"),
             ToolEvent::Error(msg) => eprintln!("  [tool] error: {msg}"),
             ToolEvent::LlmRequest => eprintln!("  [llm] requesting..."),

@@ -29,7 +29,7 @@ impl Tool for SubmitFieldsTool {
         "Submit collected field values"
     }
 
-    fn definition(&self) -> ToolDefinition {
+    fn definitions(&self) -> Vec<ToolDefinition> {
         let mut properties = serde_json::Map::new();
         for name in &self.field_names {
             properties.insert(
@@ -49,7 +49,7 @@ impl Tool for SubmitFieldsTool {
             .map(|s| s.as_str())
             .collect();
 
-        ToolDefinition::new(json!({
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "submit_fields",
@@ -60,11 +60,12 @@ impl Tool for SubmitFieldsTool {
                     "required": required
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {
@@ -116,7 +117,7 @@ mod tests {
             HashMap::from([("port".into(), "22".into()), ("user".into(), "root".into())]),
         );
 
-        let result = tool.execute(r#"{"host": "192.168.1.1"}"#).await.unwrap();
+        let result = tool.execute("submit_fields", r#"{"host": "192.168.1.1"}"#).await.unwrap();
         let values: HashMap<String, String> = serde_json::from_str(&result).unwrap();
         assert_eq!(values["host"], "192.168.1.1");
         assert_eq!(values["port"], "22");
@@ -130,7 +131,7 @@ mod tests {
             HashMap::from([("port".into(), "22".into())]),
         );
 
-        let result = tool.execute(r#"{}"#).await.unwrap();
+        let result = tool.execute("submit_fields", r#"{}"#).await.unwrap();
         assert!(result.contains("missing required fields: host"));
     }
 }

@@ -68,7 +68,7 @@ fn construct_tool(
 
 /// Print help for a tool by reading its JSON schema definition.
 fn print_tool_help(tool: &dyn crate::tools::Tool) {
-    let def = tool.definition();
+    let def = tool.cli_definition();
     let schema = &def.0;
 
     // Description (all lines before the Operations section)
@@ -139,7 +139,7 @@ pub async fn run_tool(
     // Validate parsed keys against tool schema
     validate_args(&json_args, tool.as_ref())?;
 
-    tool.execute(&json_args)
+    tool.execute(tool.name(), &json_args)
         .await
         .map_err(|e| format!("{e}"))
 }
@@ -148,7 +148,7 @@ pub async fn run_tool(
 fn validate_args(json_args: &str, tool: &dyn crate::tools::Tool) -> Result<(), String> {
     let parsed: serde_json::Value = serde_json::from_str(json_args)
         .map_err(|e| format!("invalid JSON: {e}"))?;
-    let schema = tool.definition();
+    let schema = tool.cli_definition();
     let properties = &schema.0["function"]["parameters"]["properties"];
 
     if let (Some(parsed_obj), Some(schema_obj)) = (parsed.as_object(), properties.as_object()) {

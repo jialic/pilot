@@ -136,6 +136,18 @@ fn is_text_file(key: &str) -> bool {
     )
 }
 
+impl S3Tool {
+    fn scope_desc(&self) -> String {
+        let read_globs: Vec<&str> = self.read_patterns.iter().map(|p| p.as_str()).collect();
+        let write_globs: Vec<&str> = self.write_patterns.iter().map(|p| p.as_str()).collect();
+        format!(
+            "Allowed read paths: {}. Allowed write paths: {}.",
+            if read_globs.is_empty() { "none".to_string() } else { read_globs.join(", ") + " (write paths are also readable)" },
+            if write_globs.is_empty() { "none".to_string() } else { write_globs.join(", ") },
+        )
+    }
+}
+
 impl Tool for S3Tool {
     fn name(&self) -> &str {
         "s3"
@@ -145,70 +157,37 @@ impl Tool for S3Tool {
         "Read, write, list, and delete objects in S3-compatible storage"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        let scope_desc = {
-            let read_globs: Vec<&str> = self.read_patterns.iter().map(|p| p.as_str()).collect();
-            let write_globs: Vec<&str> = self.write_patterns.iter().map(|p| p.as_str()).collect();
-            format!(
-                "Allowed read paths: {}. Allowed write paths: {}.",
-                if read_globs.is_empty() { "none".to_string() } else { read_globs.join(", ") + " (write paths are also readable)" },
-                if write_globs.is_empty() { "none".to_string() } else { write_globs.join(", ") },
-            )
-        };
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        let scope = self.scope_desc();
+        let bucket = &self.bucket.name;
+        vec![
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_list","description":format!("List objects in S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"prefix":{"type":"string","description":"Filter objects by prefix"}}}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_read","description":format!("Read object content from S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"}},"required":["key"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_write","description":format!("Write full object content to S3 bucket '{bucket}'. Creates if missing. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"},"content":{"type":"string","description":"Full object content"}},"required":["key","content"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_append","description":format!("Append text to end of object in S3 bucket '{bucket}'. Creates if missing. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"},"content":{"type":"string","description":"Text to append"}},"required":["key","content"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_edit","description":format!("Find and replace text in an existing object in S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"},"search":{"type":"string","description":"Exact text to find"},"replace":{"type":"string","description":"Text to replace it with"}},"required":["key","search","replace"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_delete","description":format!("Delete an object from S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"}},"required":["key"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_search","description":format!("Semantic search across all readable objects in S3 bucket '{bucket}'. Returns top matches ranked by relevance. {scope}"),"parameters":{"type":"object","properties":{"query":{"type":"string","description":"Natural language query"}},"required":["query"]}}})),
+        ]
+    }
 
+    fn cli_definition(&self) -> ToolDefinition {
+        let scope = self.scope_desc();
         ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "s3",
-                "description": format!(
-                    "S3 object storage. Bucket: {}.\n\n{scope_desc}\n\nOperations:\n- list: list objects. Optional 'prefix' to filter.\n- read: get object content by key.\n- write: set operation to \"write\" AND provide exactly one of the overwrite/append/edit objects.\n- delete: remove an object.\n- search: semantic search across all readable objects. Returns top matches ranked by relevance.\n\nExamples:\n  Write: {{\"operation\": \"write\", \"key\": \"f.md\", \"overwrite\": {{\"content\": \"hello\"}}}}\n  Edit:  {{\"operation\": \"write\", \"key\": \"f.md\", \"edit\": {{\"search\": \"old\", \"replace\": \"new\"}}}}\n  WRONG: {{\"operation\": \"overwrite\", ...}} — overwrite is NOT an operation.",
-                    self.bucket.name,
-                ),
+                "description": format!("S3 object storage. Bucket: {}.\n\n{scope}\n\nOperations: list, read, write (with overwrite/append/edit mode), delete, search.", self.bucket.name),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "operation": {
-                            "type": "string",
-                            "enum": ["list", "read", "write", "delete", "search"],
-                            "description": "list | read | write | delete | search"
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "Object key (for read, write, delete)"
-                        },
-                        "prefix": {
-                            "type": "string",
-                            "description": "For list: filter objects by prefix"
-                        },
-                        "overwrite": {
-                            "type": "object",
-                            "description": "Write mode: write full object content. Creates if missing.",
-                            "properties": {
-                                "content": { "type": "string", "description": "Full object content" }
-                            },
-                            "required": ["content"]
-                        },
-                        "append": {
-                            "type": "object",
-                            "description": "Write mode: append to end of object. Creates if missing.",
-                            "properties": {
-                                "content": { "type": "string", "description": "Text to append" }
-                            },
-                            "required": ["content"]
-                        },
-                        "edit": {
-                            "type": "object",
-                            "description": "Write mode: find and replace text in an existing object.",
-                            "properties": {
-                                "search": { "type": "string", "description": "Exact text to find" },
-                                "replace": { "type": "string", "description": "Text to replace it with" }
-                            },
-                            "required": ["search", "replace"]
-                        },
-                        "query": {
-                            "type": "string",
-                            "description": "For search: natural language query to find relevant objects"
-                        }
+                        "operation": { "type": "string", "enum": ["list", "read", "write", "delete", "search"], "description": "list | read | write | delete | search" },
+                        "key": { "type": "string", "description": "Object key (for read, write, delete)" },
+                        "prefix": { "type": "string", "description": "For list: filter objects by prefix" },
+                        "overwrite": { "type": "object", "description": "Write mode: write full object content.", "properties": { "content": { "type": "string", "description": "Full object content" } }, "required": ["content"] },
+                        "append": { "type": "object", "description": "Write mode: append to end of object.", "properties": { "content": { "type": "string", "description": "Text to append" } }, "required": ["content"] },
+                        "edit": { "type": "object", "description": "Write mode: find and replace text.", "properties": { "search": { "type": "string", "description": "Exact text to find" }, "replace": { "type": "string", "description": "Text to replace it with" } }, "required": ["search", "replace"] },
+                        "query": { "type": "string", "description": "For search: natural language query" }
                     },
                     "required": ["operation"]
                 }
@@ -218,6 +197,7 @@ impl Tool for S3Tool {
 
     fn execute<'a>(
         &'a self,
+        name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {
@@ -225,9 +205,35 @@ impl Tool for S3Tool {
             let args: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| ToolError::ExecutionFailed(format!("invalid arguments: {e}")))?;
 
-            let operation = args["operation"]
-                .as_str()
-                .ok_or_else(|| ToolError::ExecutionFailed("missing 'operation' field".into()))?;
+            // Remap flat LLM tool calls (s3_read, s3_write, ...) to internal format
+            let (args, operation): (serde_json::Value, String) = match name {
+                "s3_list" => (args.clone(), "list".into()),
+                "s3_read" => (args.clone(), "read".into()),
+                "s3_write" => {
+                    let mut r = json!({"operation": "write", "key": args["key"]});
+                    r["overwrite"] = json!({"content": args["content"]});
+                    (r, "write".into())
+                }
+                "s3_append" => {
+                    let mut r = json!({"operation": "write", "key": args["key"]});
+                    r["append"] = json!({"content": args["content"]});
+                    (r, "write".into())
+                }
+                "s3_edit" => {
+                    let mut r = json!({"operation": "write", "key": args["key"]});
+                    r["edit"] = json!({"search": args["search"], "replace": args["replace"]});
+                    (r, "write".into())
+                }
+                "s3_delete" => (args.clone(), "delete".into()),
+                "s3_search" => (args.clone(), "search".into()),
+                _ => {
+                    let op = args["operation"].as_str()
+                        .ok_or_else(|| ToolError::ExecutionFailed("missing 'operation' field".into()))?
+                        .to_string();
+                    (args.clone(), op)
+                }
+            };
+            let operation: &str = &operation;
 
             match operation {
                 "list" => {

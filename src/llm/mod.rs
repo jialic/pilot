@@ -253,7 +253,7 @@ pub async fn run_tool_loop(
 
         if let Some((name, arguments, id)) = LLM::extract_tool_call(&response) {
             if let Some(l) = listener {
-                l.on_tool(&ToolEvent::Called);
+                l.on_tool(&ToolEvent::Called(name.clone()));
             }
 
             let result = match dispatcher.execute(&name, &arguments).await {

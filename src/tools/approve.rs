@@ -14,8 +14,8 @@ impl Tool for ApproveTool {
         "Approve the current step and proceed"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(json!({
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "approve",
@@ -25,11 +25,12 @@ impl Tool for ApproveTool {
                     "properties": {}
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         _arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {

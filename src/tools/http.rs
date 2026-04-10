@@ -15,8 +15,8 @@ impl Tool for HttpTool {
         "Make an HTTP request and return the response body"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(json!({
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "http",
@@ -46,11 +46,12 @@ impl Tool for HttpTool {
                     "required": ["url", "method"]
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {
@@ -119,7 +120,7 @@ mod tests {
     #[test]
     fn tool_definition_valid() {
         let tool = HttpTool;
-        let def = tool.definition();
+        let def = tool.definitions().remove(0);
         assert_eq!(def.0["function"]["name"], "http");
     }
 
@@ -127,7 +128,7 @@ mod tests {
     async fn missing_url_errors() {
         let tool = HttpTool;
 
-        let result = tool.execute(r#"{"method": "GET"}"#).await;
+        let result = tool.execute("http", r#"{"method": "GET"}"#).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("url"));
     }
@@ -136,7 +137,7 @@ mod tests {
     async fn missing_method_errors() {
         let tool = HttpTool;
 
-        let result = tool.execute(r#"{"url": "https://example.com"}"#).await;
+        let result = tool.execute("http", r#"{"url": "https://example.com"}"#).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("method"));
     }
@@ -145,7 +146,7 @@ mod tests {
     async fn unsupported_method_errors() {
         let tool = HttpTool;
 
-        let result = tool.execute(r#"{"url": "https://example.com", "method": "TRACE"}"#).await;
+        let result = tool.execute("http", r#"{"url": "https://example.com", "method": "TRACE"}"#).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unsupported"));
     }

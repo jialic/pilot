@@ -25,8 +25,8 @@ impl Tool for WriteWorkflowTool {
         "Write workflow YAML content to the file"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(json!({
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "write_workflow",
@@ -42,11 +42,12 @@ impl Tool for WriteWorkflowTool {
                     "required": ["content"]
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,19 +23,37 @@ pub trait ToolDispatcher: Send + Sync {
 }
 
 /// Default dispatcher backed by a list of Tool instances.
-/// Tools are Arc-shared so cloning a dispatcher is cheap (just Arc bumps).
+/// Builds a lookup from LLM tool names to Tool instances, since one Tool
+/// can expose multiple LLM-facing definitions (e.g. file → file_read, file_write, ...).
 #[derive(Clone)]
 pub struct DefaultToolDispatcher {
     tools: Vec<Arc<dyn super::Tool>>,
+    /// LLM tool name → Tool instance (e.g. "file_write" → FileTool)
+    lookup: HashMap<String, Arc<dyn super::Tool>>,
 }
 
 impl DefaultToolDispatcher {
     pub fn new(tools: Vec<Arc<dyn super::Tool>>) -> Self {
-        Self { tools }
+        let mut lookup = HashMap::new();
+        for tool in &tools {
+            for def in tool.definitions() {
+                if let Some(name) = def.0["function"]["name"].as_str() {
+                    lookup.insert(name.to_string(), tool.clone());
+                }
+            }
+        }
+        Self { tools, lookup }
     }
 
     /// Consume self, append additional tools, return new dispatcher.
     pub fn with(mut self, additional: Vec<Arc<dyn super::Tool>>) -> Self {
+        for tool in &additional {
+            for def in tool.definitions() {
+                if let Some(name) = def.0["function"]["name"].as_str() {
+                    self.lookup.insert(name.to_string(), tool.clone());
+                }
+            }
+        }
         self.tools.extend(additional);
         self
     }
@@ -42,7 +61,7 @@ impl DefaultToolDispatcher {
 
 impl ToolDispatcher for DefaultToolDispatcher {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|t| t.definition()).collect()
+        self.tools.iter().flat_map(|t| t.definitions()).collect()
     }
 
     fn execute<'a>(
@@ -52,11 +71,10 @@ impl ToolDispatcher for DefaultToolDispatcher {
     ) -> Pin<Box<dyn Future<Output = Result<String, ToolError>> + Send + 'a>> {
         Box::pin(async move {
             let tool = self
-                .tools
-                .iter()
-                .find(|t| t.name() == name)
+                .lookup
+                .get(name)
                 .ok_or_else(|| ToolError::ExecutionFailed(format!("unknown tool: {name}")))?;
-            tool.execute(arguments).await
+            tool.execute(name, arguments).await
         })
     }
 }

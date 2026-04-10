@@ -97,6 +97,18 @@ fn expand_glob(pattern: &str) -> String {
     pattern.to_string()
 }
 
+impl FileTool {
+    fn scope_desc(&self) -> String {
+        let read_globs: Vec<String> = self.read_patterns.iter().map(|p| p.as_str().to_string()).collect();
+        let write_globs: Vec<String> = self.write_patterns.iter().map(|p| p.as_str().to_string()).collect();
+        format!(
+            "Allowed read paths: {}. Allowed write paths: {}.",
+            if read_globs.is_empty() { "none".to_string() } else { read_globs.join(", ") },
+            if write_globs.is_empty() { "none".to_string() } else { write_globs.join(", ") + " (write paths are also readable)" },
+        )
+    }
+}
+
 impl Tool for FileTool {
     fn name(&self) -> &str {
         "file"
@@ -106,20 +118,107 @@ impl Tool for FileTool {
         "Read, list, and write files within allowed paths"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        let read_globs: Vec<String> = self.read_patterns.iter().map(|p| p.as_str().to_string()).collect();
-        let write_globs: Vec<String> = self.write_patterns.iter().map(|p| p.as_str().to_string()).collect();
-        let scope_desc = format!(
-            "Allowed read paths: {}. Allowed write paths: {}.",
-            if read_globs.is_empty() { "none".to_string() } else { read_globs.join(", ") },
-            if write_globs.is_empty() { "none".to_string() } else { write_globs.join(", ") + " (write paths are also readable)" },
-        );
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        let scope = self.scope_desc();
+        vec![
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_read",
+                    "description": format!("Read file contents. Returns '(file does not exist)' if missing. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            })),
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_list",
+                    "description": format!("List directory entries, one per line, directories suffixed with /. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            })),
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_find",
+                    "description": format!("Find files matching a glob pattern. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": { "type": "string", "description": "Glob pattern (e.g. '~/projects/**/*.rs', '/tmp/*.log')" }
+                        },
+                        "required": ["pattern"]
+                    }
+                }
+            })),
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_write",
+                    "description": format!("Write full file content. Creates file if it doesn't exist. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
+                            "content": { "type": "string", "description": "Full file content" }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            })),
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_append",
+                    "description": format!("Append text to end of file. Creates file if it doesn't exist. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
+                            "content": { "type": "string", "description": "Text to append" }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            })),
+            ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_edit",
+                    "description": format!("Find and replace text in an existing file. Path must be absolute or ~/relative.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
+                            "search": { "type": "string", "description": "Exact text to find" },
+                            "replace": { "type": "string", "description": "Text to replace it with" }
+                        },
+                        "required": ["path", "search", "replace"]
+                    }
+                }
+            })),
+        ]
+    }
 
+    fn cli_definition(&self) -> ToolDefinition {
+        let scope = self.scope_desc();
         ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "file",
-                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope_desc}\n\nOperations:\n- read: return file contents. Returns '(file does not exist)' if missing.\n- list: return directory entries, one per line, directories suffixed with /.\n- write: set operation to \"write\" AND provide exactly one of the overwrite/append/edit objects.\n\nExamples:\n  Read:  {{\"operation\": \"write\", \"path\": \"~/f.md\", \"overwrite\": {{\"content\": \"hello\"}}}}\n  Edit:  {{\"operation\": \"write\", \"path\": \"~/f.md\", \"edit\": {{\"search\": \"old\", \"replace\": \"new\"}}}}\n  WRONG: {{\"operation\": \"overwrite\", ...}} — overwrite is NOT an operation."),
+                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope}\n\nOperations: read, list, find, write (with overwrite/append/edit mode)."),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -128,33 +227,23 @@ impl Tool for FileTool {
                             "enum": ["read", "list", "find", "write"],
                             "description": "read | list | find | write"
                         },
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute path (/...) or home-relative path (~/...)"
-                        },
-                        "pattern": {
-                            "type": "string",
-                            "description": "For find: glob pattern to search for files (e.g. '~/projects/**/*.rs', '/tmp/*.log')"
-                        },
+                        "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
+                        "pattern": { "type": "string", "description": "For find: glob pattern" },
                         "overwrite": {
                             "type": "object",
-                            "description": "Write mode: write full file content. Creates file if it doesn't exist.",
-                            "properties": {
-                                "content": { "type": "string", "description": "Full file content" }
-                            },
+                            "description": "Write mode: write full file content.",
+                            "properties": { "content": { "type": "string", "description": "Full file content" } },
                             "required": ["content"]
                         },
                         "append": {
                             "type": "object",
-                            "description": "Write mode: append to end of file. Creates file if it doesn't exist.",
-                            "properties": {
-                                "content": { "type": "string", "description": "Text to append" }
-                            },
+                            "description": "Write mode: append to end of file.",
+                            "properties": { "content": { "type": "string", "description": "Text to append" } },
                             "required": ["content"]
                         },
                         "edit": {
                             "type": "object",
-                            "description": "Write mode: find and replace text in an existing file.",
+                            "description": "Write mode: find and replace text.",
                             "properties": {
                                 "search": { "type": "string", "description": "Exact text to find" },
                                 "replace": { "type": "string", "description": "Text to replace it with" }
@@ -162,7 +251,7 @@ impl Tool for FileTool {
                             "required": ["search", "replace"]
                         }
                     },
-                    "required": ["operation", "path"]
+                    "required": ["operation"]
                 }
             }
         }))
@@ -170,6 +259,7 @@ impl Tool for FileTool {
 
     fn execute<'a>(
         &'a self,
+        name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {
@@ -177,9 +267,35 @@ impl Tool for FileTool {
             let args: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| ToolError::ExecutionFailed(format!("invalid arguments: {e}")))?;
 
-            let operation = args["operation"]
-                .as_str()
-                .ok_or_else(|| ToolError::ExecutionFailed("missing 'operation' field".into()))?;
+            // Remap flat LLM tool calls (file_read, file_write, ...) to internal format
+            let (args, operation): (serde_json::Value, String) = match name {
+                "file_read" => (args.clone(), "read".into()),
+                "file_list" => (args.clone(), "list".into()),
+                "file_find" => (args.clone(), "find".into()),
+                "file_write" => {
+                    let mut r = json!({"operation": "write", "path": args["path"]});
+                    r["overwrite"] = json!({"content": args["content"]});
+                    (r, "write".into())
+                }
+                "file_append" => {
+                    let mut r = json!({"operation": "write", "path": args["path"]});
+                    r["append"] = json!({"content": args["content"]});
+                    (r, "write".into())
+                }
+                "file_edit" => {
+                    let mut r = json!({"operation": "write", "path": args["path"]});
+                    r["edit"] = json!({"search": args["search"], "replace": args["replace"]});
+                    (r, "write".into())
+                }
+                _ => {
+                    // CLI path: uses original combined format
+                    let op = args["operation"].as_str()
+                        .ok_or_else(|| ToolError::ExecutionFailed("missing 'operation' field".into()))?
+                        .to_string();
+                    (args.clone(), op)
+                }
+            };
+            let operation: &str = &operation;
 
             // find uses pattern, not path
             if operation == "find" {
@@ -393,6 +509,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"read","path":"{path_str}"}}"#),
         ).await;
 
@@ -410,6 +527,7 @@ mod tests {
         ).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"read","path":"/etc/passwd"}"#,
         ).await;
 
@@ -430,6 +548,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","overwrite":{{"content":"written"}}}}"#),
         ).await;
 
@@ -451,6 +570,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","overwrite":{{"content":"new content"}}}}"#),
         ).await;
 
@@ -472,6 +592,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","append":{{"content":"first line\n"}}}}"#),
         ).await;
 
@@ -496,6 +617,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","edit":{{"search":"world","replace":"rust"}}}}"#),
         ).await;
 
@@ -517,6 +639,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","append":{{"content":"line2\n"}}}}"#),
         ).await;
 
@@ -541,6 +664,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"write","path":"{path_str}","edit":{{"search":"missing","replace":"x"}}}}"#),
         ).await;
 
@@ -558,6 +682,7 @@ mod tests {
         ).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"write","path":"/tmp/test.txt","search":"","replace":"data"}"#,
         ).await;
 
@@ -579,6 +704,7 @@ mod tests {
         ).unwrap();
 
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"list","path":"{dir_str}"}}"#),
         ).await;
 
@@ -606,6 +732,7 @@ mod tests {
         ).unwrap();
 
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"find","pattern":"{dir_str}/**/*.rs"}}"#),
         ).await.unwrap();
 
@@ -621,6 +748,7 @@ mod tests {
         let tool = FileTool::new(vec!["/tmp/**".into()], vec![]).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"find","pattern":"/tmp/nonexistent_pilot_test_dir_xyz/**/*.rs"}"#,
         ).await.unwrap();
         assert_eq!(result, "no files found");
@@ -639,6 +767,7 @@ mod tests {
 
         let dir_str = dir.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"find","pattern":"{dir_str}/**/*.rs"}}"#),
         ).await.unwrap();
 
@@ -652,6 +781,7 @@ mod tests {
         let tool = FileTool::new(vec!["/**".into()], vec![]).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"read","path":"./relative/file.txt"}"#,
         ).await;
         assert!(result.is_err());
@@ -686,6 +816,7 @@ mod tests {
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
+            "file",
             &format!(r#"{{"operation":"read","path":"{path_str}"}}"#),
         ).await;
         assert!(result.is_ok());
@@ -702,6 +833,7 @@ mod tests {
         ).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"list","path":"/etc"}"#,
         ).await;
         assert!(result.is_err());
@@ -713,6 +845,7 @@ mod tests {
         let tool = FileTool::new(vec![], vec!["/tmp/**".into()]).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"write","path":"/tmp/test.txt"}"#,
         ).await;
         assert!(result.is_ok());
@@ -724,6 +857,7 @@ mod tests {
         let tool = FileTool::new(vec!["/**".into()], vec![]).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"delete","path":"/tmp/file.txt"}"#,
         ).await;
         assert!(result.is_err());
@@ -735,6 +869,7 @@ mod tests {
         let tool = FileTool::new(vec!["/tmp/**".into()], vec![]).unwrap();
 
         let result = tool.execute(
+            "file",
             r#"{"operation":"read","path":"/tmp/nonexistent_pilot_test_file_xyz.txt"}"#,
         ).await;
         assert!(result.is_ok());

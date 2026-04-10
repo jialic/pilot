@@ -16,8 +16,8 @@ impl Tool for AskUserTool {
         "Ask the user a question and wait for their response"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(json!({
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "ask_user",
@@ -33,11 +33,12 @@ impl Tool for AskUserTool {
                     "required": ["question"]
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         _arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {

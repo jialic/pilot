@@ -34,8 +34,8 @@ impl Tool for ShellTool {
         "Run a command and return its output"
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(json!({
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "shell",
@@ -51,11 +51,12 @@ impl Tool for ShellTool {
                     "required": ["command"]
                 }
             }
-        }))
+        }))]
     }
 
     fn execute<'a>(
         &'a self,
+        _name: &'a str,
         arguments: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ToolError>> + Send + 'a>>
     {
@@ -168,7 +169,7 @@ mod tests {
     async fn execute_allowed_command() {
         let tool = ShellTool::new(vec!["^echo ".into()]).unwrap();
 
-        let result = tool.execute(r#"{"command": "echo hello"}"#).await;
+        let result = tool.execute("shell", r#"{"command": "echo hello"}"#).await;
         assert!(result.is_ok());
         assert!(result.unwrap().contains("hello"));
     }
@@ -177,7 +178,7 @@ mod tests {
     async fn execute_rejected_command() {
         let tool = ShellTool::new(vec!["^echo ".into()]).unwrap();
 
-        let result = tool.execute(r#"{"command": "rm -rf /"}"#).await;
+        let result = tool.execute("shell", r#"{"command": "rm -rf /"}"#).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not allowed"), "error should mention not allowed: {err}");
