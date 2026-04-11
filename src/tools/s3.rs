@@ -167,7 +167,7 @@ impl Tool for S3Tool {
             ToolDefinition::new(json!({"type":"function","function":{"name":"s3_append","description":format!("Append text to end of object in S3 bucket '{bucket}'. Creates if missing. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"},"content":{"type":"string","description":"Text to append"}},"required":["key","content"]}}})),
             ToolDefinition::new(json!({"type":"function","function":{"name":"s3_edit","description":format!("Find and replace text in an existing object in S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"},"search":{"type":"string","description":"Exact text to find"},"replace":{"type":"string","description":"Text to replace it with"}},"required":["key","search","replace"]}}})),
             ToolDefinition::new(json!({"type":"function","function":{"name":"s3_delete","description":format!("Delete an object from S3 bucket '{bucket}'. {scope}"),"parameters":{"type":"object","properties":{"key":{"type":"string","description":"Object key"}},"required":["key"]}}})),
-            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_search","description":format!("Semantic search across all readable objects in S3 bucket '{bucket}'. Returns top matches ranked by relevance. {scope}"),"parameters":{"type":"object","properties":{"query":{"type":"string","description":"Natural language query"}},"required":["query"]}}})),
+            ToolDefinition::new(json!({"type":"function","function":{"name":"s3_search","description":format!("Semantic search across all readable objects in S3 bucket '{bucket}'. Returns top matches ranked by relevance. Optional prefix to scope to a subfolder. {scope}"),"parameters":{"type":"object","properties":{"query":{"type":"string","description":"Natural language query"},"prefix":{"type":"string","description":"Filter results to keys starting with this prefix"}},"required":["query"]}}})),
         ]
     }
 
@@ -362,6 +362,7 @@ impl Tool for S3Tool {
                 "search" => {
                     let query = args["query"].as_str()
                         .ok_or_else(|| ToolError::ExecutionFailed("search requires 'query'".into()))?;
+                    let prefix = args["prefix"].as_str();
 
                     let llm = self.llm.as_ref()
                         .ok_or_else(|| ToolError::ExecutionFailed("search requires LLM client for embeddings".into()))?;
@@ -511,10 +512,17 @@ impl Tool for S3Tool {
                     let query_json = serde_json::to_string(query_embedding)
                         .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
 
-                    let mut rows = conn.query(
-                        "SELECT s3_key, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
-                        libsql::params![query_json],
-                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db query: {e}")))?;
+                    let mut rows = if let Some(pfx) = prefix {
+                        conn.query(
+                            "SELECT s3_key, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks WHERE s3_key LIKE ?2 ORDER BY distance ASC LIMIT 10",
+                            libsql::params![query_json, format!("{pfx}%")],
+                        ).await
+                    } else {
+                        conn.query(
+                            "SELECT s3_key, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
+                            libsql::params![query_json],
+                        ).await
+                    }.map_err(|e| ToolError::ExecutionFailed(format!("db query: {e}")))?;
 
                     let mut output: Vec<serde_json::Value> = Vec::new();
                     while let Some(row) = rows.next().await
