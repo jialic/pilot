@@ -59,11 +59,11 @@ pub fn chunk_text(text: &str, chunk_size: usize, overlap: usize) -> Vec<Chunk> {
     chunks
 }
 
-/// Default chunk size in characters (~512 tokens for English markdown).
-pub const DEFAULT_CHUNK_SIZE: usize = 2000;
+/// Default chunk size in characters (~3000 tokens, roughly 3 pages of prose).
+pub const DEFAULT_CHUNK_SIZE: usize = 12000;
 
-/// Default overlap in characters (~50 tokens).
-pub const DEFAULT_OVERLAP: usize = 200;
+/// Default overlap in characters (20% of chunk size, shared with each neighbor).
+pub const DEFAULT_OVERLAP: usize = 2400;
 
 #[cfg(test)]
 mod tests {
