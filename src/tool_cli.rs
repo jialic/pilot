@@ -63,6 +63,16 @@ fn construct_tool(
             )
             .map_err(|e| format!("S3 tool error: {e}"))?))
         }
+        ExposedToolDef::File { read, write, semantic_index } => {
+            Ok(Box::new(crate::tools::file::FileTool::new(
+                read.clone(),
+                write.clone(),
+                *semantic_index,
+                llm,
+                yaml_path,
+            )
+            .map_err(|e| format!("File tool error: {e}"))?))
+        }
     }
 }
 

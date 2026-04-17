@@ -20,15 +20,37 @@ const S3_MIGRATIONS: &[(u32, &[&str])] = &[
     ]),
 ];
 
+const FILE_MIGRATIONS: &[(u32, &[&str])] = &[
+    // 0 → 1: initial schema (path-keyed, mtime-versioned, FK cascade)
+    (0, &[
+        "CREATE TABLE files (path TEXT PRIMARY KEY, mtime TEXT NOT NULL)",
+        "CREATE TABLE chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE, chunk_offset INTEGER, chunk_text TEXT NOT NULL, embedding F32_BLOB(1536) NOT NULL)",
+        "CREATE INDEX idx_chunks_path ON chunks(path)",
+    ]),
+];
+
 /// Run pending migrations on the S3 cache database.
-///
-/// Uses PRAGMA user_version to track schema version. If a migration fails,
-/// deletes the database file and retries from scratch (it's a cache).
 pub async fn run_s3_migrations(
     conn: &libsql::Connection,
     db_path: &std::path::Path,
 ) -> Result<(), String> {
-    match run_migrations(conn).await {
+    run_migrations_with(conn, db_path, S3_MIGRATIONS).await
+}
+
+/// Run pending migrations on the local file cache database.
+pub async fn run_file_migrations(
+    conn: &libsql::Connection,
+    db_path: &std::path::Path,
+) -> Result<(), String> {
+    run_migrations_with(conn, db_path, FILE_MIGRATIONS).await
+}
+
+async fn run_migrations_with(
+    conn: &libsql::Connection,
+    db_path: &std::path::Path,
+    migrations: &[(u32, &[&str])],
+) -> Result<(), String> {
+    match run_migrations(conn, migrations).await {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::warn!("migration failed ({e}), rebuilding cache");
@@ -38,15 +60,18 @@ pub async fn run_s3_migrations(
     }
 }
 
-async fn run_migrations(conn: &libsql::Connection) -> Result<(), String> {
+async fn run_migrations(
+    conn: &libsql::Connection,
+    migrations: &[(u32, &[&str])],
+) -> Result<(), String> {
     let version = get_user_version(conn).await?;
-    let target = S3_MIGRATIONS.iter().map(|(v, _)| v + 1).max().unwrap_or(0);
+    let target = migrations.iter().map(|(v, _)| v + 1).max().unwrap_or(0);
 
     if version >= target {
         return Ok(());
     }
 
-    for (from_version, statements) in S3_MIGRATIONS {
+    for (from_version, statements) in migrations {
         if version > *from_version {
             continue;
         }

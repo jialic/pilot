@@ -101,7 +101,7 @@ fn validate_step(_index: usize, step: &Step) -> Result<(), WorkflowError> {
 
 fn validate_tools(tools: &[ToolDef]) -> Result<(), WorkflowError> {
     for tool in tools {
-        if let ToolDef::File { read, write } = tool {
+        if let ToolDef::File { read, write, .. } = tool {
             for path in read.iter().chain(write.iter()) {
                 if !path.starts_with('/') && !path.starts_with("~/") {
                     return Err(WorkflowError::InvalidToolConfig(

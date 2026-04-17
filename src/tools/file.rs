@@ -1,6 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crate::llm::ToolDefinition;
+use crate::llm::{LlmClient, ToolDefinition};
 use serde_json::json;
 
 use super::{Tool, ToolError};
@@ -31,10 +34,23 @@ fn home_dir() -> Option<PathBuf> {
 pub struct FileTool {
     read_patterns: Vec<glob::Pattern>,
     write_patterns: Vec<glob::Pattern>,
+    semantic_index: bool,
+    cache_key: String,
+    llm: Option<Arc<dyn LlmClient>>,
 }
 
 impl FileTool {
-    pub fn new(read_globs: Vec<String>, write_globs: Vec<String>) -> Result<Self, String> {
+    pub fn new(
+        read_globs: Vec<String>,
+        write_globs: Vec<String>,
+        semantic_index: bool,
+        llm: Option<Arc<dyn LlmClient>>,
+        yaml_path: &str,
+    ) -> Result<Self, String> {
+        if semantic_index && llm.is_none() {
+            return Err("semantic_index requires OpenAI API key for embeddings".into());
+        }
+
         let read_patterns = read_globs
             .iter()
             .map(|g| {
@@ -53,9 +69,16 @@ impl FileTool {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let mut hasher = DefaultHasher::new();
+        yaml_path.hash(&mut hasher);
+        let cache_key = format!("{:x}", hasher.finish());
+
         Ok(Self {
             read_patterns,
             write_patterns,
+            semantic_index,
+            cache_key,
+            llm,
         })
     }
 
@@ -107,6 +130,231 @@ impl FileTool {
             if write_globs.is_empty() { "none".to_string() } else { write_globs.join(", ") + " (write paths are also readable)" },
         )
     }
+
+    async fn do_search(&self, args: &serde_json::Value) -> Result<String, ToolError> {
+        use crate::chunker::{chunk_text, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP};
+        use futures::stream::{self, StreamExt};
+
+        let query = args["query"].as_str()
+            .ok_or_else(|| ToolError::ExecutionFailed("search requires 'query'".into()))?;
+        let prefix = args["prefix"].as_str();
+
+        let llm = self.llm.as_ref()
+            .ok_or_else(|| ToolError::ExecutionFailed("search requires LLM client for embeddings".into()))?;
+
+        // 1. List readable files by walking globs; collect path + mtime
+        let mut entries: Vec<FileEntry> = Vec::new();
+        for pat in &self.read_patterns {
+            let glob_results = glob::glob(pat.as_str())
+                .map_err(|e| ToolError::ExecutionFailed(format!("invalid glob pattern: {e}")))?;
+            for entry in glob_results {
+                let path = match entry {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if !path.is_file() {
+                    continue;
+                }
+                let path_str = path.to_string_lossy().to_string();
+                if !is_text_file(&path_str) {
+                    continue;
+                }
+                let mtime = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().to_string())
+                    .unwrap_or_default();
+                entries.push(FileEntry { path: path_str, mtime });
+            }
+        }
+
+        // 2. Open libsql db
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| ToolError::ExecutionFailed("HOME not set".into()))?;
+        let cache_dir = std::path::PathBuf::from(home)
+            .join(".pilot")
+            .join("cache")
+            .join("file");
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| ToolError::ExecutionFailed(format!("cache dir: {e}")))?;
+        let db_path = cache_dir.join(format!("{}.db", self.cache_key));
+
+        let db = libsql::Builder::new_local(&db_path)
+            .build().await
+            .map_err(|e| ToolError::ExecutionFailed(format!("db open: {e}")))?;
+        let conn = db.connect()
+            .map_err(|e| ToolError::ExecutionFailed(format!("db connect: {e}")))?;
+        conn.execute("PRAGMA foreign_keys = ON", ())
+            .await.map_err(|e| ToolError::ExecutionFailed(format!("pragma: {e}")))?;
+
+        super::migrate::run_file_migrations(&conn, &db_path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
+        // 3. Diff
+        let mut cached: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut rows = conn.query("SELECT path, mtime FROM files", ())
+            .await.map_err(|e| ToolError::ExecutionFailed(format!("db files read: {e}")))?;
+        while let Some(row) = rows.next().await
+            .map_err(|e| ToolError::ExecutionFailed(format!("db files row: {e}")))? {
+            let p: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("row: {e}")))?;
+            let m: String = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row: {e}")))?;
+            cached.insert(p, m);
+        }
+
+        let diff = diff_file_index(&entries, &cached);
+
+        for path in &diff.stale {
+            conn.execute("DELETE FROM files WHERE path = ?1", libsql::params![path.clone()])
+                .await.map_err(|e| ToolError::ExecutionFailed(format!("db delete file: {e}")))?;
+        }
+
+        if entries.is_empty() {
+            return Ok("(no searchable files found)".into());
+        }
+
+        tracing::info!(
+            total = entries.len(),
+            cached = entries.len() - diff.new.len(),
+            new = diff.new.len().saturating_sub(diff.stale.len()),
+            stale = diff.stale.len(),
+            "file search index sync",
+        );
+
+        if !diff.new.is_empty() {
+            let tasks: Vec<_> = diff.new.iter().map(|&idx| {
+                (entries[idx].path.clone(), entries[idx].mtime.clone())
+            }).collect();
+
+            let results: Vec<Result<(), ToolError>> = stream::iter(tasks.into_iter().map(|(path, mtime)| {
+                let llm = llm.clone();
+                let conn = conn.clone();
+                async move {
+                    let body = std::fs::read_to_string(&path)
+                        .map_err(|e| ToolError::ExecutionFailed(format!("read failed {path}: {e}")))?;
+                    let chunks = chunk_text(&body, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP);
+
+                    // Insert placeholder with empty mtime (satisfies FK, marks as in-progress)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO files (path, mtime) VALUES (?1, '')",
+                        libsql::params![path.clone()],
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert file: {e}")))?;
+
+                    if !chunks.is_empty() {
+                        let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+                        let embeddings = llm.embed(&texts)
+                            .await
+                            .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+
+                        for (i, emb) in embeddings.iter().enumerate() {
+                            let emb_json = serde_json::to_string(emb)
+                                .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+                            conn.execute(
+                                "INSERT INTO chunks (path, chunk_offset, chunk_text, embedding) VALUES (?1, ?2, ?3, vector32(?4))",
+                                libsql::params![path.clone(), chunks[i].offset as i64, chunks[i].text.clone(), emb_json],
+                            ).await.map_err(|e| ToolError::ExecutionFailed(format!("db insert chunk: {e}")))?;
+                        }
+                    }
+
+                    // Set real mtime — marks file as fully indexed
+                    conn.execute(
+                        "UPDATE files SET mtime = ?1 WHERE path = ?2",
+                        libsql::params![mtime.clone(), path.clone()],
+                    ).await.map_err(|e| ToolError::ExecutionFailed(format!("db update mtime: {e}")))?;
+
+                    Ok(())
+                }
+            }))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+
+            for result in results {
+                result?;
+            }
+        }
+
+        // 4. Embed query and search
+        let query_embeddings = llm.embed(&[query.to_string()])
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("embedding failed: {e}")))?;
+        if query_embeddings.is_empty() || query_embeddings[0].is_empty() {
+            return Ok("(no embeddings returned)".into());
+        }
+        let query_embedding = &query_embeddings[0];
+
+        let query_json = serde_json::to_string(query_embedding)
+            .map_err(|e| ToolError::ExecutionFailed(format!("json: {e}")))?;
+
+        let mut rows = if let Some(pfx) = prefix {
+            let expanded = expand_home(pfx).to_string_lossy().to_string();
+            conn.query(
+                "SELECT path, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks WHERE path LIKE ?2 ORDER BY distance ASC LIMIT 10",
+                libsql::params![query_json, format!("{expanded}%")],
+            ).await
+        } else {
+            conn.query(
+                "SELECT path, chunk_text, vector_distance_cos(embedding, vector32(?1)) AS distance FROM chunks ORDER BY distance ASC LIMIT 10",
+                libsql::params![query_json],
+            ).await
+        }.map_err(|e| ToolError::ExecutionFailed(format!("db query: {e}")))?;
+
+        let mut output: Vec<serde_json::Value> = Vec::new();
+        while let Some(row) = rows.next().await
+            .map_err(|e| ToolError::ExecutionFailed(format!("db row: {e}")))? {
+            let path: String = row.get(0).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+            let chunk_text: String = row.get(1).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+            let distance: f64 = row.get(2).map_err(|e| ToolError::ExecutionFailed(format!("row get: {e}")))?;
+            let similarity = 1.0 - distance;
+            output.push(serde_json::json!({
+                "path": path,
+                "cosine_similarity": (similarity * 1000.0).round() / 1000.0,
+                "chunk": chunk_text,
+            }));
+        }
+
+        Ok(serde_json::to_string_pretty(&output)
+            .unwrap_or_else(|_| "[]".into()))
+    }
+}
+
+struct FileEntry {
+    path: String,
+    mtime: String,
+}
+
+struct FileIndexDiff {
+    stale: Vec<String>,
+    new: Vec<usize>,
+}
+
+fn diff_file_index(entries: &[FileEntry], cached: &std::collections::HashMap<String, String>) -> FileIndexDiff {
+    let current_paths: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+
+    let mut stale: Vec<String> = Vec::new();
+    for (cached_path, cached_mtime) in cached {
+        if !current_paths.contains(cached_path.as_str()) {
+            stale.push(cached_path.clone());
+        } else if let Some(entry) = entries.iter().find(|e| &e.path == cached_path) {
+            if entry.mtime != *cached_mtime {
+                stale.push(cached_path.clone());
+            }
+        }
+    }
+
+    let stale_set: std::collections::HashSet<&str> = stale.iter().map(|s| s.as_str()).collect();
+    let new: Vec<usize> = entries.iter().enumerate()
+        .filter(|(_, e)| !cached.contains_key(&e.path) || stale_set.contains(e.path.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+
+    FileIndexDiff { stale, new }
+}
+
+fn is_text_file(path: &str) -> bool {
+    matches!(
+        path.rsplit('.').next(),
+        Some("md" | "txt" | "yaml" | "yml" | "json" | "toml" | "csv" | "xml" | "html" | "rst" | "org" | "log" | "rs" | "py" | "js" | "ts" | "go" | "java" | "c" | "cpp" | "h" | "hpp")
+    )
 }
 
 impl Tool for FileTool {
@@ -120,7 +368,7 @@ impl Tool for FileTool {
 
     fn definitions(&self) -> Vec<ToolDefinition> {
         let scope = self.scope_desc();
-        vec![
+        let mut defs = vec![
             ToolDefinition::new(json!({
                 "type": "function",
                 "function": {
@@ -209,48 +457,78 @@ impl Tool for FileTool {
                     }
                 }
             })),
-        ]
+        ];
+        if self.semantic_index {
+            defs.push(ToolDefinition::new(json!({
+                "type": "function",
+                "function": {
+                    "name": "file_search",
+                    "description": format!("Semantic search across readable files. Returns top matches ranked by relevance. Optional prefix to scope to a subfolder.\n\n{scope}"),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Natural language query" },
+                            "prefix": { "type": "string", "description": "Filter results to paths starting with this prefix" }
+                        },
+                        "required": ["query"]
+                    }
+                }
+            })));
+        }
+        defs
     }
 
     fn cli_definition(&self) -> ToolDefinition {
         let scope = self.scope_desc();
+        let ops: &[&str] = if self.semantic_index {
+            &["read", "list", "find", "write", "search"]
+        } else {
+            &["read", "list", "find", "write"]
+        };
+        let op_desc = ops.join(" | ");
+        let ops_help = if self.semantic_index {
+            "read, list, find, write (with overwrite/append/edit mode), search (semantic)"
+        } else {
+            "read, list, find, write (with overwrite/append/edit mode)"
+        };
+        let mut properties = json!({
+            "operation": { "type": "string", "enum": ops, "description": op_desc },
+            "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
+            "pattern": { "type": "string", "description": "For find: glob pattern" },
+            "overwrite": {
+                "type": "object",
+                "description": "Write mode: write full file content.",
+                "properties": { "content": { "type": "string", "description": "Full file content" } },
+                "required": ["content"]
+            },
+            "append": {
+                "type": "object",
+                "description": "Write mode: append to end of file.",
+                "properties": { "content": { "type": "string", "description": "Text to append" } },
+                "required": ["content"]
+            },
+            "edit": {
+                "type": "object",
+                "description": "Write mode: find and replace text.",
+                "properties": {
+                    "search": { "type": "string", "description": "Exact text to find" },
+                    "replace": { "type": "string", "description": "Text to replace it with" }
+                },
+                "required": ["search", "replace"]
+            }
+        });
+        if self.semantic_index {
+            properties["query"] = json!({ "type": "string", "description": "For search: natural language query" });
+            properties["prefix"] = json!({ "type": "string", "description": "For search: filter results by path prefix" });
+        }
         ToolDefinition::new(json!({
             "type": "function",
             "function": {
                 "name": "file",
-                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope}\n\nOperations: read, list, find, write (with overwrite/append/edit mode)."),
+                "description": format!("File operations. All paths must be absolute or ~/relative.\n\n{scope}\n\nOperations: {ops_help}."),
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "operation": {
-                            "type": "string",
-                            "enum": ["read", "list", "find", "write"],
-                            "description": "read | list | find | write"
-                        },
-                        "path": { "type": "string", "description": "Absolute path (/...) or home-relative path (~/...)" },
-                        "pattern": { "type": "string", "description": "For find: glob pattern" },
-                        "overwrite": {
-                            "type": "object",
-                            "description": "Write mode: write full file content.",
-                            "properties": { "content": { "type": "string", "description": "Full file content" } },
-                            "required": ["content"]
-                        },
-                        "append": {
-                            "type": "object",
-                            "description": "Write mode: append to end of file.",
-                            "properties": { "content": { "type": "string", "description": "Text to append" } },
-                            "required": ["content"]
-                        },
-                        "edit": {
-                            "type": "object",
-                            "description": "Write mode: find and replace text.",
-                            "properties": {
-                                "search": { "type": "string", "description": "Exact text to find" },
-                                "replace": { "type": "string", "description": "Text to replace it with" }
-                            },
-                            "required": ["search", "replace"]
-                        }
-                    },
+                    "properties": properties,
                     "required": ["operation"]
                 }
             }
@@ -287,6 +565,7 @@ impl Tool for FileTool {
                     r["edit"] = json!({"search": args["search"], "replace": args["replace"]});
                     (r, "write".into())
                 }
+                "file_search" => (args.clone(), "search".into()),
                 _ => {
                     // CLI path: uses original combined format
                     let op = args["operation"].as_str()
@@ -296,6 +575,12 @@ impl Tool for FileTool {
                 }
             };
             let operation: &str = &operation;
+
+            if operation == "search" && !self.semantic_index {
+                return Err(ToolError::ExecutionFailed(
+                    "search not available: semantic_index is not enabled for this tool".into()
+                ));
+            }
 
             // find uses pattern, not path
             if operation == "find" {
@@ -321,6 +606,11 @@ impl Tool for FileTool {
                 } else {
                     Ok(results.join("\n"))
                 };
+            }
+
+            // search doesn't use path — handle before path extraction
+            if operation == "search" {
+                return self.do_search(&args).await;
             }
 
             let path = args["path"]
@@ -433,13 +723,16 @@ mod tests {
         let tool = FileTool::new(
             vec!["/tmp/test/**".into()],
             vec!["/tmp/output/**".into()],
+            false,
+            None,
+            "",
         );
         assert!(tool.is_ok());
     }
 
     #[test]
     fn invalid_glob_pattern_errors() {
-        let result = FileTool::new(vec!["[invalid".into()], vec![]);
+        let result = FileTool::new(vec!["[invalid".into()], vec![], false, None, "");
         assert!(result.is_err());
     }
 
@@ -448,6 +741,9 @@ mod tests {
         let tool = FileTool::new(
             vec!["/tmp/src/**".into()],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
         assert!(tool.is_readable("/tmp/src/main.rs"));
         assert!(tool.is_readable("/tmp/src/deep/nested/file.rs"));
@@ -459,6 +755,9 @@ mod tests {
         let tool = FileTool::new(
             vec![],
             vec!["/tmp/output/**".into()],
+            false,
+            None,
+            "",
         ).unwrap();
         assert!(tool.is_writable("/tmp/output/result.txt"));
         assert!(!tool.is_writable("/tmp/src/main.rs"));
@@ -466,7 +765,7 @@ mod tests {
 
     #[test]
     fn empty_patterns_reject_all() {
-        let tool = FileTool::new(vec![], vec![]).unwrap();
+        let tool = FileTool::new(vec![], vec![], false, None, "").unwrap();
         assert!(!tool.is_readable("/any/path"));
         assert!(!tool.is_writable("/any/path"));
     }
@@ -505,6 +804,9 @@ mod tests {
         let tool = FileTool::new(
             vec![format!("{dir_str}/**")],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let path_str = file.to_string_lossy();
@@ -524,6 +826,9 @@ mod tests {
         let tool = FileTool::new(
             vec!["/tmp/allowed/**".into()],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let result = tool.execute(
@@ -544,6 +849,9 @@ mod tests {
         let tool = FileTool::new(
             vec![],
             vec![format!("{dir_str}/**")],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let path_str = file.to_string_lossy();
@@ -566,7 +874,7 @@ mod tests {
         std::fs::write(&file, "old content").unwrap();
 
         let dir_str = dir.to_string_lossy();
-        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")]).unwrap();
+        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")], false, None, "").unwrap();
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
@@ -588,7 +896,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let dir_str = dir.to_string_lossy();
-        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")]).unwrap();
+        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")], false, None, "").unwrap();
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
@@ -613,6 +921,9 @@ mod tests {
         let tool = FileTool::new(
             vec![],
             vec![format!("{dir_str}/**")],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let path_str = file.to_string_lossy();
@@ -635,7 +946,7 @@ mod tests {
         std::fs::write(&file, "line1\n").unwrap();
 
         let dir_str = dir.to_string_lossy();
-        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")]).unwrap();
+        let tool = FileTool::new(vec![], vec![format!("{dir_str}/**")], false, None, "").unwrap();
 
         let path_str = file.to_string_lossy();
         let result = tool.execute(
@@ -660,6 +971,9 @@ mod tests {
         let tool = FileTool::new(
             vec![],
             vec![format!("{dir_str}/**")],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let path_str = file.to_string_lossy();
@@ -679,6 +993,9 @@ mod tests {
         let tool = FileTool::new(
             vec!["/tmp/**".into()],
             vec![], // no write access
+            false,
+            None,
+            "",
         ).unwrap();
 
         let result = tool.execute(
@@ -701,6 +1018,9 @@ mod tests {
         let tool = FileTool::new(
             vec![format!("{dir_str}/**")],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let result = tool.execute(
@@ -729,6 +1049,9 @@ mod tests {
         let tool = FileTool::new(
             vec![format!("{dir_str}/**")],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let result = tool.execute(
@@ -745,7 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_no_matches_returns_message() {
-        let tool = FileTool::new(vec!["/tmp/**".into()], vec![]).unwrap();
+        let tool = FileTool::new(vec!["/tmp/**".into()], vec![], false, None, "").unwrap();
 
         let result = tool.execute(
             "file",
@@ -763,6 +1086,9 @@ mod tests {
         let tool = FileTool::new(
             vec!["/nonexistent/**".into()], // no access to temp dir
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let dir_str = dir.to_string_lossy();
@@ -778,7 +1104,7 @@ mod tests {
 
     #[tokio::test]
     async fn relative_path_rejected() {
-        let tool = FileTool::new(vec!["/**".into()], vec![]).unwrap();
+        let tool = FileTool::new(vec!["/**".into()], vec![], false, None, "").unwrap();
 
         let result = tool.execute(
             "file",
@@ -793,6 +1119,9 @@ mod tests {
         let tool = FileTool::new(
             vec![], // no read patterns
             vec!["/tmp/output/**".into()],
+            false,
+            None,
+            "",
         ).unwrap();
         // Write path is also readable
         assert!(tool.is_readable("/tmp/output/file.txt"));
@@ -812,6 +1141,9 @@ mod tests {
         let tool = FileTool::new(
             vec![], // no explicit read
             vec![format!("{dir_str}/**")], // write implies read
+            false,
+            None,
+            "",
         ).unwrap();
 
         let path_str = file.to_string_lossy();
@@ -830,6 +1162,9 @@ mod tests {
         let tool = FileTool::new(
             vec!["/tmp/allowed/**".into()],
             vec![],
+            false,
+            None,
+            "",
         ).unwrap();
 
         let result = tool.execute(
@@ -842,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_missing_mode() {
-        let tool = FileTool::new(vec![], vec!["/tmp/**".into()]).unwrap();
+        let tool = FileTool::new(vec![], vec!["/tmp/**".into()], false, None, "").unwrap();
 
         let result = tool.execute(
             "file",
@@ -854,7 +1189,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_operation() {
-        let tool = FileTool::new(vec!["/**".into()], vec![]).unwrap();
+        let tool = FileTool::new(vec!["/**".into()], vec![], false, None, "").unwrap();
 
         let result = tool.execute(
             "file",
@@ -866,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_nonexistent_file() {
-        let tool = FileTool::new(vec!["/tmp/**".into()], vec![]).unwrap();
+        let tool = FileTool::new(vec!["/tmp/**".into()], vec![], false, None, "").unwrap();
 
         let result = tool.execute(
             "file",

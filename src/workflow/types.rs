@@ -124,8 +124,12 @@ pub enum ToolDef {
         allowed: Vec<String>,
     },
     File {
+        #[serde(default)]
         read: Vec<String>,
+        #[serde(default)]
         write: Vec<String>,
+        #[serde(default)]
+        semantic_index: bool,
     },
     Http,
     Input,
@@ -153,6 +157,14 @@ pub enum ExposedToolDef {
     S3 {
         #[serde(flatten)]
         config: S3ToolConfig,
+    },
+    File {
+        #[serde(default)]
+        read: Vec<String>,
+        #[serde(default)]
+        write: Vec<String>,
+        #[serde(default)]
+        semantic_index: bool,
     },
 }
 

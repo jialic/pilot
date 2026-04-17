@@ -101,9 +101,15 @@ pub fn build_tool_dispatcher(tool_defs: &[ToolDef], s3_config: &S3Config, llm: O
                     super::shell::ShellTool::new(allowed.clone())
                         .expect("invalid shell allowed pattern")
                 ),
-                ToolDef::File { read, write } => Arc::new(
-                    super::file::FileTool::new(read.clone(), write.clone())
-                        .expect("invalid file glob pattern")
+                ToolDef::File { read, write, semantic_index } => Arc::new(
+                    super::file::FileTool::new(
+                        read.clone(),
+                        write.clone(),
+                        *semantic_index,
+                        llm.clone(),
+                        &s3_config.yaml_path,
+                    )
+                    .expect("invalid file tool config")
                 ),
                 ToolDef::Http => Arc::new(super::http::HttpTool),
                 ToolDef::Input => Arc::new(super::input::InputTool),
