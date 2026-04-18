@@ -101,13 +101,19 @@ WORKFLOW DISCOVERY:
 
 EXPOSED TOOLS:
   Tools can be exposed as standalone CLI commands via .pilot/tools/<name>.yaml.
-  Each file defines a single tool with scoped permissions:
+  Each file defines a single tool (s3 or file) with scoped permissions:
 
-    # .pilot/tools/todos.yaml
+    # .pilot/tools/todos.yaml — S3-backed
     name: s3
     bucket: mine
     read: [\"*\"]
     write: [\"projects/pilot/*\"]
+
+    # .pilot/tools/mynotes.yaml — local file-backed
+    name: file
+    read: [\"~/notes/**\"]
+    write: [\"~/notes/**\"]
+    semantic_index: true   # opt-in, enables `--operation search --query ...`
 
   Invoke with: pilot tool <name> --key value
   Supports dot notation for nesting: --edit.search \"old\" --edit.replace \"new\"
@@ -168,6 +174,13 @@ pub fn print_tools() {
             println!("  {}", "Required config (pilot config set):".dimmed());
             for (key, desc) in &req {
                 println!("    {}: {}", key.bold(), desc);
+            }
+        }
+        if let Some(yaml) = tool.exposed_yaml() {
+            println!();
+            println!("  {}", "Exposed as CLI (.pilot/tools/<name>.yaml):".dimmed());
+            for line in yaml.lines() {
+                println!("    {}", line);
             }
         }
         println!();

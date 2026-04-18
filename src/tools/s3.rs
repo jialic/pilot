@@ -171,6 +171,41 @@ impl Tool for S3Tool {
         ]
     }
 
+    fn cli_help(&self) -> Option<String> {
+        let scope = self.scope_desc();
+        let bucket = &self.bucket.name;
+        Some(format!(r#"S3 object storage. Bucket: {bucket}.
+{scope}
+
+Usage: pilot tool <name> --operation <op> [args]
+
+Operations:
+
+  list     List objects (optionally filtered by prefix).
+    Required: --operation list
+    Optional: --prefix <pfx>
+    Example: pilot tool <name> --operation list --prefix docs/
+
+  read     Read an object's content.
+    Required: --operation read --key <key>
+    Example: pilot tool <name> --operation read --key docs/foo.md
+
+  write    Write object content. Choose exactly ONE mode:
+    overwrite (full replace): pilot tool <name> --operation write --key docs/foo.md --overwrite.content "hello"
+    append    (add to end):   pilot tool <name> --operation write --key docs/foo.md --append.content "\nmore"
+    edit      (find/replace): pilot tool <name> --operation write --key docs/foo.md --edit.search "old" --edit.replace "new"
+
+  delete   Delete an object.
+    Required: --operation delete --key <key>
+    Example: pilot tool <name> --operation delete --key docs/foo.md
+
+  search   Semantic search across readable objects. Returns top matches ranked by relevance.
+    Required: --operation search --query <text>
+    Optional: --prefix <pfx>   (scope results to keys starting with prefix)
+    Example: pilot tool <name> --operation search --query "authentication flow"
+    Example: pilot tool <name> --operation search --query "todos" --prefix projects/"#))
+    }
+
     fn cli_definition(&self) -> ToolDefinition {
         let scope = self.scope_desc();
         ToolDefinition::new(json!({

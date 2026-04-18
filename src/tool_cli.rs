@@ -76,8 +76,13 @@ fn construct_tool(
     }
 }
 
-/// Print help for a tool by reading its JSON schema definition.
+/// Print help for a tool. If the tool provides cli_help(), use that verbatim.
+/// Otherwise, fall back to auto-generation from the JSON schema.
 fn print_tool_help(tool: &dyn crate::tools::Tool) {
+    if let Some(help) = tool.cli_help() {
+        eprintln!("{help}");
+        return;
+    }
     let def = tool.cli_definition();
     let schema = &def.0;
 

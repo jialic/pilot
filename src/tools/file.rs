@@ -478,6 +478,45 @@ impl Tool for FileTool {
         defs
     }
 
+    fn cli_help(&self) -> Option<String> {
+        let scope = self.scope_desc();
+        let mut s = format!(r#"File operations. All paths must be absolute or ~/relative.
+{scope}
+
+Usage: pilot tool <name> --operation <op> [args]
+
+Operations:
+
+  read     Read file contents. Returns '(file does not exist)' if missing.
+    Required: --operation read --path <path>
+    Example: pilot tool <name> --operation read --path ~/notes/foo.md
+
+  list     List directory entries, one per line (directories suffixed with /).
+    Required: --operation list --path <dir>
+    Example: pilot tool <name> --operation list --path ~/notes/
+
+  find     Find files matching a glob pattern.
+    Required: --operation find --pattern <glob>
+    Example: pilot tool <name> --operation find --pattern "~/notes/**/*.md"
+
+  write    Write file content. Choose exactly ONE mode:
+    overwrite (full replace): pilot tool <name> --operation write --path ~/notes/foo.md --overwrite.content "hello"
+    append    (add to end):   pilot tool <name> --operation write --path ~/notes/foo.md --append.content "\nmore"
+    edit      (find/replace): pilot tool <name> --operation write --path ~/notes/foo.md --edit.search "old" --edit.replace "new""#);
+        if self.semantic_index {
+            s.push_str(r#"
+
+  search   Semantic search across readable files. Returns top matches ranked by relevance.
+    Required: --operation search --query <text>
+    Optional: --prefix <path-prefix>   (scope results to paths starting with prefix)
+    Example: pilot tool <name> --operation search --query "rate limit retry"
+    Example: pilot tool <name> --operation search --query "todo" --prefix ~/notes/projects/"#);
+        } else {
+            s.push_str("\n\n  (search operation is disabled. Enable via 'semantic_index: true' in the tool's YAML.)");
+        }
+        Some(s)
+    }
+
     fn cli_definition(&self) -> ToolDefinition {
         let scope = self.scope_desc();
         let ops: &[&str] = if self.semantic_index {

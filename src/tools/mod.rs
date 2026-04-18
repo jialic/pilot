@@ -45,6 +45,13 @@ pub trait Tool: Send + Sync {
         self.definitions().into_iter().next().unwrap()
     }
 
+    /// Optional hand-written help text for the `pilot tool <name>` CLI path.
+    /// If Some, replaces the auto-generated help. Use for tools with complex
+    /// schemas where structured per-operation docs are clearer.
+    fn cli_help(&self) -> Option<String> {
+        None
+    }
+
     /// Execute the tool. `name` is the LLM-facing tool name (e.g. "file_write").
     /// Returns Ok(result_string) on success.
     /// Returns Ok(error_message) for soft failures the model should retry.

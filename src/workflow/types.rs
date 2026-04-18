@@ -78,6 +78,7 @@ impl ToolName {
             ToolName::File => vec![
                 ("read", "List of glob patterns for readable paths. Paths must be absolute or ~/relative. Empty list = no read access."),
                 ("write", "List of glob patterns for writable paths. Paths must be absolute or ~/relative. Empty list = no write access."),
+                ("semantic_index", "Optional bool (default false). Enable semantic search — indexes readable files and exposes file_search tool. Requires OpenAI API key for embeddings."),
             ],
             ToolName::S3 => vec![
                 ("bucket", "Required. S3 bucket name."),
@@ -97,6 +98,30 @@ impl ToolName {
                 ("s3_secret_key", "Secret access key"),
             ],
             _ => vec![],
+        }
+    }
+
+    /// YAML example for exposing this tool as a CLI command via
+    /// .pilot/tools/<name>.yaml. Returns None for tools that can't be exposed.
+    pub fn exposed_yaml(&self) -> Option<&'static str> {
+        match self {
+            ToolName::S3 => Some(
+                "# .pilot/tools/todos.yaml\n\
+                 name: s3\n\
+                 bucket: mine\n\
+                 read: [\"*\"]\n\
+                 write: [\"projects/pilot/*\"]\n\
+                 # Invoke: pilot tool todos --operation list --prefix projects/pilot/"
+            ),
+            ToolName::File => Some(
+                "# .pilot/tools/mynotes.yaml\n\
+                 name: file\n\
+                 read: [\"~/notes/**\"]\n\
+                 write: [\"~/notes/**\"]\n\
+                 semantic_index: true  # opt-in, enables `--operation search`\n\
+                 # Invoke: pilot tool mynotes --operation read --path ~/notes/foo.md"
+            ),
+            _ => None,
         }
     }
 }
