@@ -1,26 +1,36 @@
 # Pilot
 
-AI workflows in YAML. Your prompts are the code.
+Permission-scoped tools for AI assistants.
 
-- Prompts are the logic. Edit YAML, run, iterate — no rebuild, no deploy. No framework, no abstractions.
-- Fearless workflows. Read the YAML, know the worst case. Each step declares what the LLM can do.
-- Batteries included. Loops, branching, parallel, data transformation — all in YAML. Shell and HTTP when you need custom logic.
+Declare what a tool can read and write in YAML. Pilot enforces the
+scope at runtime. Claude Code, Cursor, or any other agent with shell
+access can invoke your tools without being able to step outside the
+boundaries you defined.
+
+**Read the YAML, know the worst case.**
 
 ```yaml
-steps:
-  - action: read_input
-    prompt: What do you want to research?
-  - action: llm
-    tools:
-      - name: shell
-        allowed: ["^curl ", "^jq "]
-    prompt: Research this topic using web APIs. Summarize your findings.
-  - action: llm
-    prompt: Write a brief report based on the research above.
+# .pilot/tools/notes.yaml — local files scoped to one directory
+name: file
+read:  ["~/notes/**"]
+write: ["~/notes/**"]
+semantic_index: true   # opt-in; enables --operation search --query ...
 ```
 
+```yaml
+# .pilot/tools/todos.yaml — S3-backed, scoped writes
+name: s3
+bucket: mine
+read:  ["*"]
+write: ["projects/pilot/*"]
 ```
-$ pilot run research.yaml
+
+Invoke:
+
+```
+$ pilot tool notes --operation read --path ~/notes/today.md
+$ pilot tool todos --operation edit --path projects/pilot/next.md \
+                   --edit.search "TODO: ship" --edit.replace "DONE"
 ```
 
 ## Install
@@ -31,53 +41,63 @@ cargo install --git https://github.com/jialic/pilot
 
 ## Quick Start
 
-Configure your API key:
+Configure credentials as needed (semantic-index tools need an OpenAI
+or Anthropic key for embeddings; S3 tools need bucket credentials):
 
 ```
 pilot config set openai_api_key sk-...
+pilot config show
 ```
 
-Run an example:
+Drop a tool definition at `.pilot/tools/<name>.yaml`:
 
-```
-pilot run examples/chat.yaml
-```
-
-## Examples
-
-Coding agent with scoped permissions — you can see exactly what it can do:
 ```yaml
-steps:
-  - action: read_input
-    prompt: What do you want me to do?
-  # Loop: runs body, then checks while_sql. Body output is available as 'input'.
-  # __continue column controls whether to loop. Stops when LLM outputs "done".
-  - action: loop
-    while_sql: "SELECT CASE WHEN output = 'done' THEN 'false' ELSE 'true' END AS __continue FROM input"
-    body:
-      - action: llm
-        tools:
-          - name: file
-            read: ["src/**", "tests/**", "*.toml"]
-            write: ["src/**", "tests/**"]
-          - name: shell
-            allowed: ["^cargo (build|test|check)", "^git diff"]
-        prompt: |
-          Read the relevant code, make the requested changes,
-          and run tests to verify. Output "done" when finished.
+name: file
+read:  ["~/code/**"]
+write: []    # read-only
 ```
 
-More examples: [chat](examples/chat.yaml), [code review](examples/code-review.yaml), [multi-model comparison](examples/second-opinion.yaml), [each](examples/each.yaml), [parallel](examples/parallel.yaml), [select](examples/select.yaml), [trigger](examples/trigger.yaml)
-
-## Learn More
+Invoke:
 
 ```
-pilot help             # overview
-pilot help actions     # all action types
-pilot help tools       # all LLM tools
-pilot help models      # supported models
-pilot explain <name>   # explain a workflow
+pilot tool <name>                      # show parameters for the tool
+pilot tool <name> --key value ...      # run it
 ```
+
+Dot notation for nested args: `--edit.search "old" --edit.replace "new"`.
+Pilot searches `.pilot/tools/` in the current directory and parents,
+so tools can be per-project, per-user (`~/.pilot/tools/`), or a mix.
+
+## Why
+
+LLM agents get more capable every month, and the blast radius grows
+with them. Most frameworks bury tool permissions inside code that's
+hard to audit. Pilot's bet is that the format matters more than the
+framework: if your agent can shell out, scope the shell with a regex;
+if it can touch files, scope the glob. The permission policy is the
+first thing you see when you open the YAML.
+
+## Commands
+
+```
+pilot tool <name> [--key value ...]    Call an exposed tool
+pilot config set <key> <value>         Configure API keys / credentials
+pilot config show                      Show current config (masked)
+pilot test                             Verify API connections
+pilot help                             Overview
+pilot help tools                       Tool types + required config
+pilot help models                      Supported models
+```
+
+## History
+
+Pilot started as a YAML workflow engine — steps as goals, LLM as one
+node, Arrow tables between steps, a full pipeline story. That code is
+still in the repo for reference (`src/legacy.rs` for the CLI glue;
+`src/runner.rs`, `src/workflow/`, `src/dag_v2/` for the engine) but
+is no longer wired into the CLI. Smart models plus agent frameworks
+(Claude Code et al.) absorbed the orchestration role; the permission
+layer — scoped tools — is the part that kept earning its keep.
 
 ## License
 
