@@ -68,6 +68,37 @@ Dot notation for nested args: `--edit.search "old" --edit.replace "new"`.
 Pilot searches `.pilot/tools/` in the current directory and parents,
 so tools can be per-project, per-user (`~/.pilot/tools/`), or a mix.
 
+## Agents
+
+An agent is a markdown file. The body is the task; optional YAML
+frontmatter declares which model runs it and which tools it can use.
+Frontmatter tool entries use the same schema as `.pilot/tools/<name>.yaml` —
+reference a tool by name or define one inline.
+
+```markdown
+---
+model: anthropic/claude-opus-4-7
+tools:
+  - notes                       # reference .pilot/tools/notes.yaml
+  - name: scratch                # inline definition
+    type: file
+    read:  ["/tmp/**"]
+    write: ["/tmp/**"]
+---
+
+Read today's notes. Summarize the top 3 actionable items in under
+200 words, markdown.
+```
+
+Run it:
+
+```
+pilot agent morning.md
+```
+
+No frontmatter required — a file with just a prompt body also works
+(uses the configured default model, no tools).
+
 ## Why
 
 LLM agents get more capable every month, and the blast radius grows
@@ -75,11 +106,13 @@ with them. Most frameworks bury tool permissions inside code that's
 hard to audit. Pilot's bet is that the format matters more than the
 framework: if your agent can shell out, scope the shell with a regex;
 if it can touch files, scope the glob. The permission policy is the
-first thing you see when you open the YAML.
+first thing you see when you open the YAML — whether it's a tool file
+or an agent file.
 
 ## Commands
 
 ```
+pilot agent <file.md>                  Run an agent (prompt + scoped tools)
 pilot tool <name> [--key value ...]    Call an exposed tool
 pilot config set <key> <value>         Configure API keys / credentials
 pilot config show                      Show current config (masked)
@@ -92,12 +125,17 @@ pilot help models                      Supported models
 ## History
 
 Pilot started as a YAML workflow engine — steps as goals, LLM as one
-node, Arrow tables between steps, a full pipeline story. That code is
-still in the repo for reference (`src/legacy.rs` for the CLI glue;
-`src/runner.rs`, `src/workflow/`, `src/dag_v2/` for the engine) but
-is no longer wired into the CLI. Smart models plus agent frameworks
-(Claude Code et al.) absorbed the orchestration role; the permission
-layer — scoped tools — is the part that kept earning its keep.
+node, Arrow tables between steps, a full pipeline story. That runtime
+is still here (`src/runner.rs`, `src/workflow/`, `src/dag_v2/`), now
+used internally: `pilot agent <file.md>` synthesizes a single-step
+workflow under the hood so agents reuse the battle-tested core.
+
+The workflow-era CLI subcommands (`run` / `ls` / `explain` / `update`)
+were removed from the user surface; their glue lives in
+`src/legacy.rs` for reference. Smart models plus agent frameworks
+(Claude Code et al.) absorbed explicit orchestration; the permission
+layer — scoped tools — and the single-prompt agent runner are the
+pieces that kept earning their keep.
 
 ## License
 

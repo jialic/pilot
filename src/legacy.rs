@@ -1,90 +1,26 @@
 //! Legacy workflow-era code — kept for reference.
 //!
-//! Pilot pivoted away from the YAML-workflow engine to a
-//! permission-scoped tool broker (see main.rs / tool_cli.rs). The
-//! workflow subsystem itself (runner, dag_v2, producers_v2, workflow,
-//! discovery, explain, update) is still compiled inside the `pilot`
-//! crate so nothing bit-rots and the behavior can be revived if
-//! needed. This module collects the thin CLI glue that used to connect
-//! those subsystems to the `pilot` binary: the StdinIO UserIO impl,
-//! the TracingEvents RunnerEvents impl, the resolve_workflow helper,
-//! and the original HELP_TEXT that described the workflow model.
+//! Pilot pivoted away from the YAML-workflow CLI surface to two things:
+//!   - `pilot agent <file.md>` (see src/agent.rs) — prompt + scoped tools
+//!   - `pilot tool <name>`    (see src/tool_cli.rs) — standalone CLI tools
 //!
-//! Nothing in this module is referenced from the active CLI. It lives
-//! here so the reader of main.rs sees only the current product, and so
-//! the historical behavior stays one import away if it ever needs to
-//! be reinstated.
+//! Both reuse the workflow runtime under the hood. What got removed from
+//! the CLI is the `run` / `ls` / `explain` / `update` subcommands and the
+//! thin helper for workflow resolution / workflow-only help text.
+//!
+//! Currently-active CLI-host adapters (StdinIO, TracingEvents) moved to
+//! `src/cli_io.rs` because they're reused by the agent path. This module
+//! retains only the pieces that are truly dead: the workflow-path resolver
+//! and the original workflow-era help text.
 
 #![allow(dead_code)]
 
-use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use colored::Colorize;
 
-use pilot::events::RunnerEvents;
-use pilot::user_io::UserIO;
-
 // --------------------------------------------------------------------------
-// StdinIO — user interaction via stdin/stdout (workflow's read_input step)
-// --------------------------------------------------------------------------
-
-pub struct StdinIO;
-
-impl UserIO for StdinIO {
-    fn ask(
-        &self,
-        question: String,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
-    {
-        Box::pin(async move {
-            if !question.is_empty() {
-                println!("{}", question);
-            }
-            print!("{} ", ">".yellow());
-            io::stdout().flush().map_err(|e| e.to_string())?;
-
-            let stdin = io::stdin();
-            let mut lines = Vec::new();
-            for line in stdin.lock().lines() {
-                let line = line.map_err(|e| e.to_string())?;
-                if line.is_empty() && !lines.is_empty() {
-                    break;
-                }
-                if line.is_empty() && lines.is_empty() {
-                    // Single enter on empty input = submit empty
-                    break;
-                }
-                lines.push(line);
-            }
-
-            if !lines.is_empty() {
-                println!("{}", "✓".green());
-            }
-
-            Ok(lines.join("\n"))
-        })
-    }
-}
-
-// --------------------------------------------------------------------------
-// TracingEvents — runner lifecycle events surfaced to the terminal
-// --------------------------------------------------------------------------
-
-pub struct TracingEvents;
-
-impl RunnerEvents for TracingEvents {
-    fn workflow_done(&self) {
-        tracing::info!("✓ Workflow complete.");
-    }
-
-    fn workflow_error(&self, error: &str) {
-        tracing::error!("✗ {}", error);
-    }
-}
-
-// --------------------------------------------------------------------------
-// Workflow resolution — shared by run and update subcommands (removed)
+// Workflow resolution — was shared by the removed run / update subcommands
 // --------------------------------------------------------------------------
 
 /// Resolve a workflow name/path to a file path.

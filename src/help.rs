@@ -42,7 +42,29 @@ INVOKE A TOOL:
   pilot tool <name> --key value ...      Run the tool with arguments
     Dot notation for nesting: --edit.search \"old\" --edit.replace \"new\"
 
+RUN AN AGENT:
+  An agent is a markdown file with optional YAML frontmatter. The body
+  is the prompt; the frontmatter declares which tools the agent can
+  call, which model runs it, and safety limits. Frontmatter tool entries
+  use the same schema as .pilot/tools/<name>.yaml — reference a tool by
+  name (string) or define it inline (object).
+
+    ---
+    model: anthropic/claude-opus-4-7
+    tools:
+      - notes               # reference .pilot/tools/notes.yaml
+      - name: scratch       # inline definition
+        type: file
+        read:  [\"/tmp/**\"]
+        write: [\"/tmp/**\"]
+    ---
+
+    Read today's notes and summarize the top 3 items in under 200 words.
+
+  pilot agent <file.md>                  Run the agent, print response
+
 COMMANDS:
+  pilot agent <file.md>                  Run an agent (prompt + scoped tools)
   pilot tool <name> [--key value ...]    Call an exposed tool
   pilot config set <key> <value>         Configure API keys / credentials
   pilot config show                      Show current config (masked)
@@ -54,7 +76,9 @@ NOTES:
   The YAML-workflow runtime (pilot run / pilot ls / pilot explain /
   pilot update) is no longer exposed. Smarter models + agent frameworks
   (Claude Code etc.) subsume the orchestration role; pilot's remaining
-  value is the auditable permission layer for tool access.";
+  value is the auditable permission layer for tool access. Agents run
+  on top of the same workflow runtime (synthesized to a single llm
+  step) — see src/agent.rs.";
 
 pub fn print_actions() {
     let schemas = Action::all_schemas();

@@ -164,7 +164,7 @@ pub enum ToolDef {
     },
 }
 
-/// Shared S3 tool configuration — used by both workflow ToolDef and ExposedToolDef.
+/// Shared S3 tool configuration — used by ToolDef::S3 everywhere.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct S3ToolConfig {
     pub bucket: String,
@@ -174,24 +174,13 @@ pub struct S3ToolConfig {
     pub write: Vec<String>,
 }
 
-/// Tool definition for `pilot tool` CLI — exposed tools with scoped permissions.
-/// One per YAML file in `.pilot/tools/`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "name", rename_all = "snake_case")]
-pub enum ExposedToolDef {
-    S3 {
-        #[serde(flatten)]
-        config: S3ToolConfig,
-    },
-    File {
-        #[serde(default)]
-        read: Vec<String>,
-        #[serde(default)]
-        write: Vec<String>,
-        #[serde(default)]
-        semantic_index: bool,
-    },
-}
+// Note: `ToolDef` (defined above) is the single canonical type for tool
+// definitions. It's used in three places with the same YAML schema:
+//   1. `.pilot/tools/<name>.yaml` — standalone CLI-exposable tools
+//      (only s3 + file make sense here; other variants error at invoke time)
+//   2. Agent frontmatter `tools:` inline entries (src/agent.rs)
+//   3. Workflow llm step `tools:` arrays
+// The legacy `ExposedToolDef` narrow type was removed in favor of ToolDef.
 
 /// A reference to a file. Holds the path, provides methods to read content.
 /// Deserializes from a plain string in YAML.

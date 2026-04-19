@@ -27,6 +27,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run an agent — markdown file with YAML frontmatter
+    Agent {
+        /// Path to the agent markdown file
+        file: std::path::PathBuf,
+        /// Errors only
+        #[arg(short, long)]
+        quiet: bool,
+        /// Show lifecycle events
+        #[arg(short, long)]
+        verbose: bool,
+        /// Show debug details (LLM requests, internals)
+        #[arg(long)]
+        debug: bool,
+    },
+
     /// Test API connection with a simple request
     Test,
 
@@ -93,6 +108,70 @@ async fn main() {
     // prior user-facing docs.
     // ----------------------------------------------------------------------
     match cli.command {
+        Commands::Agent { file, quiet, verbose, debug } => {
+            // Tracing verbosity
+            let filter = if debug { "debug" } else if verbose { "info" } else if quiet { "error" } else { "warn" };
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| filter.into()),
+                )
+                .with_target(false)
+                .without_time()
+                .init();
+
+            let cfg = match load_config() {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".red());
+                    eprintln!("Run 'pilot config set' to configure credentials.");
+                    std::process::exit(1);
+                }
+            };
+
+            let mut agent = match pilot::agent::parse_agent(&file) {
+                Ok(a) => a,
+                Err(e) => { eprintln!("{} {e}", "error:".red()); std::process::exit(1); }
+            };
+
+            let resolved_tools = match pilot::agent::resolve_tools(
+                agent.frontmatter.tools.take()
+            ) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("{} {e}", "error:".red()); std::process::exit(1); }
+            };
+
+            let workflow = pilot::agent::build_workflow(agent, resolved_tools);
+
+            let llm_config = cfg.to_llm_config();
+            let io: std::sync::Arc<dyn pilot::user_io::UserIO> =
+                std::sync::Arc::new(pilot::cli_io::StdinIO);
+            let events: std::sync::Arc<dyn pilot::events::RunnerEvents> =
+                std::sync::Arc::new(pilot::cli_io::TracingEvents);
+            let yaml_path = file.canonicalize().unwrap_or(file.clone());
+            let runner = pilot::runner::Runner::new(
+                llm_config,
+                &cfg,
+                workflow,
+                io,
+                events,
+                std::collections::HashMap::new(),
+                &yaml_path.to_string_lossy(),
+            );
+
+            match runner.run().await {
+                Ok(output_bytes) => {
+                    let text = pilot::sql::cli::arrow_bytes_to_json(&output_bytes)
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&output_bytes).to_string());
+                    println!("{}", text);
+                }
+                Err(e) => {
+                    eprintln!("\n{} {e}", "✗ Agent failed:".red().bold());
+                    std::process::exit(1);
+                }
+            }
+        }
+
         Commands::Test => {
             let cfg = match load_config() {
                 Ok(cfg) => cfg,

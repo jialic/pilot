@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::args::parse_args_to_json;
 use crate::config::Config;
-use crate::workflow::ExposedToolDef;
+use crate::workflow::ToolDef;
 
 /// Discover tool YAML file from .pilot/tools/ directories.
 fn find_tool_yaml(name: &str) -> Result<PathBuf, String> {
@@ -27,17 +27,20 @@ fn find_tool_yaml(name: &str) -> Result<PathBuf, String> {
     Err(format!("tool '{name}' not found. Create .pilot/tools/{name}.yaml"))
 }
 
-/// Load and parse an exposed tool definition.
-fn load_tool_def(path: &PathBuf) -> Result<ExposedToolDef, String> {
+/// Load and parse a tool definition. Files in `.pilot/tools/` use the same
+/// ToolDef schema as agent frontmatter inline tools and workflow llm steps.
+fn load_tool_def(path: &PathBuf) -> Result<ToolDef, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     serde_yaml::from_str(&content)
         .map_err(|e| format!("cannot parse {}: {e}", path.display()))
 }
 
-/// Construct a Tool instance from an ExposedToolDef.
+/// Construct a runtime Tool instance from a ToolDef. Only the variants that
+/// make sense as standalone CLI commands (storage-backed: s3, file) are
+/// supported here; others error clearly at invoke time.
 fn construct_tool(
-    tool_def: &ExposedToolDef,
+    tool_def: &ToolDef,
     cfg: &Config,
     yaml_path: &str,
 ) -> Result<Box<dyn crate::tools::Tool>, String> {
@@ -50,7 +53,7 @@ fn construct_tool(
     };
 
     match tool_def {
-        ExposedToolDef::S3 { config } => {
+        ToolDef::S3 { config } => {
             Ok(Box::new(crate::tools::s3::S3Tool::new(
                 &cfg.s3_endpoint,
                 &cfg.s3_access_key,
@@ -63,7 +66,7 @@ fn construct_tool(
             )
             .map_err(|e| format!("S3 tool error: {e}"))?))
         }
-        ExposedToolDef::File { read, write, semantic_index } => {
+        ToolDef::File { read, write, semantic_index } => {
             Ok(Box::new(crate::tools::file::FileTool::new(
                 read.clone(),
                 write.clone(),
@@ -73,6 +76,29 @@ fn construct_tool(
             )
             .map_err(|e| format!("File tool error: {e}"))?))
         }
+        // Other ToolDef variants (shell, http, ask_user, approve, abort,
+        // submit_fields, input) are for use inside an agent's `llm` tool
+        // loop — they aren't meaningful as standalone CLI commands.
+        other => Err(format!(
+            "tool type '{}' cannot be exposed as a standalone CLI command — \
+             only 's3' and 'file' tools are supported here. \
+             Use this tool inside an agent instead.",
+            tool_def_type_name(other)
+        )),
+    }
+}
+
+fn tool_def_type_name(t: &ToolDef) -> &'static str {
+    match t {
+        ToolDef::AskUser => "ask_user",
+        ToolDef::Approve => "approve",
+        ToolDef::Abort => "abort",
+        ToolDef::SubmitFields => "submit_fields",
+        ToolDef::Shell { .. } => "shell",
+        ToolDef::File { .. } => "file",
+        ToolDef::Http => "http",
+        ToolDef::Input => "input",
+        ToolDef::S3 { .. } => "s3",
     }
 }
 
